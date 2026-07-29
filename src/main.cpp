@@ -1,23 +1,14 @@
 /*
-  Pico + TMC2209 (UART config) + FastAccelStepper (STEP/DIR motion)
+  Pico + TMC2209 UART diagnostics + FastAccelStepper
+
+  If `t` used to freeze: often TX (GP4) is shorted to GND from an old
+  breadboard short. This build checks pins BEFORE any Serial1 write.
 
   Wiring (normal):
-    STEP -> GP3
-    DIR  -> GP2
-    EN   -> GND
-    Pico GP4 (TX) -> TMC Rx
-    Pico GP5 (RX) <- TMC Tx
-    VIO -> 3.3V , VM -> motor PSU , GND common
-    CLK unconnected
-
-  IMPORTANT: On TMC2209, MS1/MS2 set the UART *address*:
-    MS1=0 MS2=0 -> addr 0
-    MS1=1 MS2=0 -> addr 1
-    MS1=0 MS2=1 -> addr 2
-    MS1=1 MS2=1 -> addr 3
-  Command `t` scans all 4 addresses.
-
-  Serial 115200, Newline. Use `h` before any UART command.
+    GP4 TX -> TMC Rx
+    GP5 RX <- TMC Tx
+    STEP GP3, DIR GP2, EN->GND
+    VIO 3.3V, VM motor PSU, GND common
 */
 
 #include <Arduino.h>
@@ -30,8 +21,8 @@ static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
 static const int8_t ENABLE_PIN = -1;
 
-static const uint8_t TMC_TX_PIN_DEFAULT = 4;
-static const uint8_t TMC_RX_PIN_DEFAULT = 5;
+static const uint8_t PIN_A = 4;  // normally TX
+static const uint8_t PIN_B = 5;  // normally RX
 static const float R_SENSE = 0.11f;
 
 static const uint16_t DEFAULT_RMS_MA = 300;
@@ -42,15 +33,13 @@ static const int32_t DEFAULT_STEP_SIZE = 8;
 
 #define SERIAL_PORT Serial1
 
-uint8_t tmcTxPin = TMC_TX_PIN_DEFAULT;
-uint8_t tmcRxPin = TMC_RX_PIN_DEFAULT;
-uint8_t driverAddress = 0b00;
+uint8_t tmcTxPin = PIN_A;
+uint8_t tmcRxPin = PIN_B;
+uint8_t driverAddress = 0;
 bool uartPinsSwapped = false;
 bool uartPortStarted = false;
 
-// Recreated whenever address changes
 TMC2209Stepper *driver = nullptr;
-
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = nullptr;
 
@@ -65,148 +54,226 @@ void recreateDriver(uint8_t addr) {
   driver = new TMC2209Stepper(&SERIAL_PORT, R_SENSE, driverAddress);
 }
 
-void ensureUartPort() {
+void stopUartPort() {
   if (uartPortStarted) {
-    return;
+    SERIAL_PORT.end();
+    delay(10);
+    uartPortStarted = false;
   }
+  pinMode(PIN_A, INPUT);
+  pinMode(PIN_B, INPUT);
+}
+
+// Returns false if a pin looks shorted to GND — do NOT start UART.
+bool checkPinsNotShortedToGnd() {
+  stopUartPort();
+  delay(5);
+
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+  delay(5);
+
+  const int a = digitalRead(PIN_A);
+  const int b = digitalRead(PIN_B);
+
+  Serial.print(F("Pin check (INPUT_PULLUP): GP4="));
+  Serial.print(a == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("  GP5="));
+  Serial.println(b == HIGH ? F("HIGH") : F("LOW"));
+
+  if (a == LOW || b == LOW) {
+    Serial.println(F("FAIL: pin stuck LOW = short to GND (or TMC holding line down)."));
+    Serial.println(F("  1) Unplug TMC UART wires and run k again"));
+    Serial.println(F("  2) Move driver to a NEW breadboard area / fresh jumper wires"));
+    Serial.println(F("  3) If still LOW with nothing attached, Pico GPIO may be damaged"));
+    return false;
+  }
+
+  Serial.println(F("Pin check OK (both float HIGH with pullups)"));
+  return true;
+}
+
+bool ensureUartPortSafe() {
+  if (uartPortStarted) {
+    return true;
+  }
+  if (!checkPinsNotShortedToGnd()) {
+    return false;
+  }
+
   SERIAL_PORT.setTX(tmcTxPin);
   SERIAL_PORT.setRX(tmcRxPin);
   SERIAL_PORT.begin(115200);
-  delay(50);
+  delay(30);
   while (SERIAL_PORT.available()) {
     SERIAL_PORT.read();
   }
   uartPortStarted = true;
-}
-
-void restartUartPort() {
-  if (uartPortStarted) {
-    SERIAL_PORT.end();
-    delay(20);
-    uartPortStarted = false;
-  }
-  ensureUartPort();
-}
-
-uint8_t readVersionAtAddress(uint8_t addr) {
-  recreateDriver(addr);
-  ensureUartPort();
-  while (SERIAL_PORT.available()) {
-    SERIAL_PORT.read();
-  }
-  delay(5);
-  return driver->version();
+  return true;
 }
 
 void printHelp() {
-  Serial.println(F("\nCommands:"));
-  Serial.println(F("  h      help (no UART)"));
-  Serial.println(F("  p      motion status (no UART)"));
-  Serial.println(F("  + / -  nudge"));
-  Serial.println(F("  n/s/a/g/z/x   stepSize/speed/accel/goto/zero/stop"));
-  Serial.println(F("  t      scan UART addresses 0..3 (version)"));
-  Serial.println(F("  w      swap Pico TX/RX pins and retry wiring"));
-  Serial.println(F("  u      apply default TMC settings (uses last OK addr)"));
-  Serial.println(F("  c mA   set RMS current"));
-  Serial.println(F("  m N    set microsteps"));
-  Serial.println(F("  i      driver status"));
-  Serial.println(F("\nMS1/MS2 = UART address. If jumpers set for microsteps, addr may be 1/2/3."));
+  Serial.println(F("\nCommands (safe ones first):"));
+  Serial.println(F("  h   help"));
+  Serial.println(F("  k   pin short check (do this first)"));
+  Serial.println(F("  l   UART loopback hint / test helpers"));
+  Serial.println(F("  t   TMC version scan (only if k passes)"));
+  Serial.println(F("  w   swap TX/RX mapping"));
+  Serial.println(F("  u   apply TMC defaults"));
+  Serial.println(F("  c/m/i/+/- /p/x   current/microsteps/status/move/..."));
+  Serial.println(F("\nAfter a shorted driver: rewire on a FRESH breadboard section."));
 }
 
 void printMotionStatus() {
   Serial.print(F("pos="));
   Serial.print(stepper ? stepper->getCurrentPosition() : 0);
-  if (stepper) {
-    Serial.print(F("  running="));
-    Serial.print(stepper->isRunning() ? F("yes") : F("no"));
-    Serial.print(F("  speedHz="));
-    Serial.print(stepper->getSpeedInMilliHz() / 1000UL);
-  }
   Serial.print(F("  stepSize="));
   Serial.print(stepSize);
   Serial.print(F("  addr="));
   Serial.print(driverAddress);
-  Serial.print(F("  uartSwapped="));
+  Serial.print(F("  swapped="));
   Serial.println(uartPinsSwapped ? F("yes") : F("no"));
 }
 
+void loopbackHelp() {
+  Serial.println(F("\nLoopback test (TMC UART wires DISCONNECTED):"));
+  Serial.println(F("  1) Run k  — both pins must be HIGH"));
+  Serial.println(F("  2) Jumper GP4 directly to GP5"));
+  Serial.println(F("  3) Run b  — should echo a byte OK"));
+  Serial.println(F("  4) Remove jumper, reconnect to TMC Rx/Tx, run k then t"));
+}
+
+void loopbackByteTest() {
+  stopUartPort();
+  if (!checkPinsNotShortedToGnd()) {
+    return;
+  }
+
+  // User should have GP4 jumpered to GP5 for this test
+  SERIAL_PORT.setTX(tmcTxPin);
+  SERIAL_PORT.setRX(tmcRxPin);
+  SERIAL_PORT.begin(115200);
+  uartPortStarted = true;
+  delay(20);
+  while (SERIAL_PORT.available()) {
+    SERIAL_PORT.read();
+  }
+
+  Serial.println(F("Loopback: writing 0xA5 (GP4 must be jumpered to GP5)..."));
+  Serial.flush();
+
+  SERIAL_PORT.write((uint8_t)0xA5);
+  SERIAL_PORT.flush();
+
+  const uint32_t start = millis();
+  int got = -1;
+  while (millis() - start < 200) {
+    if (SERIAL_PORT.available()) {
+      got = SERIAL_PORT.read();
+      break;
+    }
+    delay(1);
+  }
+
+  if (got == 0xA5) {
+    Serial.println(F("Loopback OK — Pico UART pins work"));
+  } else {
+    Serial.print(F("Loopback FAIL (got "));
+    Serial.print(got);
+    Serial.println(F("). Pins/wiring/Serial1 problem — do not run t yet"));
+  }
+
+  stopUartPort();
+}
+
+uint8_t readVersionAtAddress(uint8_t addr) {
+  recreateDriver(addr);
+  while (SERIAL_PORT.available()) {
+    SERIAL_PORT.read();
+  }
+  delay(5);
+  // version() can still block if TX hardware is wedged — only call after k passes
+  return driver->version();
+}
+
 void testUart() {
-  ensureUartPort();
-  Serial.println(F("UART scan: addresses 0..3"));
-  Serial.print(F("  Pico TX=GP"));
+  Serial.println(F("Pre-check before TMC UART..."));
+  Serial.flush();
+  stopUartPort();
+
+  if (!ensureUartPortSafe()) {
+    Serial.println(F("Aborting t — fix shorts first (k)"));
+    return;
+  }
+
+  Serial.println(F("Scanning TMC addresses 0..3 (each read has library timeout)"));
+  Serial.print(F("TX=GP"));
   Serial.print(tmcTxPin);
-  Serial.print(F(" -> should go to TMC Rx"));
-  Serial.print(F(" | Pico RX=GP"));
-  Serial.print(tmcRxPin);
-  Serial.println(F(" <- TMC Tx"));
+  Serial.print(F(" RX=GP"));
+  Serial.println(tmcRxPin);
   Serial.flush();
 
   int found = -1;
   for (uint8_t addr = 0; addr < 4; addr++) {
     Serial.print(F("  addr "));
     Serial.print(addr);
-    Serial.print(F(": version=0x"));
+    Serial.print(F(": "));
     Serial.flush();
 
     const uint8_t ver = readVersionAtAddress(addr);
+    Serial.print(F("version=0x"));
     Serial.print(ver, HEX);
 
     if (ver == 0x21 || ver == 0x20) {
-      Serial.println(F("  OK"));
+      Serial.println(F(" OK"));
       found = addr;
       break;
     }
-    Serial.println(F("  fail"));
-    delay(20);
+    Serial.println(F(" fail"));
   }
 
   if (found >= 0) {
     recreateDriver((uint8_t)found);
-    Serial.print(F("Using address "));
+    Serial.print(F("Using addr "));
     Serial.println(found);
-    Serial.println(F("Next: u   then   c 300   then   +"));
   } else {
-    Serial.println(F("No response on any address."));
-    Serial.println(F("Try: w  (swap TX/RX) then t again"));
-    Serial.println(F("Also check VIO=3.3V, GND common, EN=GND, VM on"));
+    Serial.println(F("No TMC response. Try w then t, or check VIO/EN/VM."));
   }
 }
 
 void swapUartPins() {
   uartPinsSwapped = !uartPinsSwapped;
   if (uartPinsSwapped) {
-    // Swapped: treat silk labels as backwards
-    tmcTxPin = TMC_RX_PIN_DEFAULT;  // GP5 as TX
-    tmcRxPin = TMC_TX_PIN_DEFAULT;  // GP4 as RX
+    tmcTxPin = PIN_B;
+    tmcRxPin = PIN_A;
   } else {
-    tmcTxPin = TMC_TX_PIN_DEFAULT;
-    tmcRxPin = TMC_RX_PIN_DEFAULT;
+    tmcTxPin = PIN_A;
+    tmcRxPin = PIN_B;
   }
-  Serial.print(F("UART pins now: TX=GP"));
+  stopUartPort();
+  Serial.print(F("Now TX=GP"));
   Serial.print(tmcTxPin);
   Serial.print(F(" RX=GP"));
   Serial.println(tmcRxPin);
-  restartUartPort();
-  Serial.println(F("Run t again"));
 }
 
 void applyDriverDefaults() {
-  ensureUartPort();
+  if (!ensureUartPortSafe()) {
+    return;
+  }
   if (!driver) {
     recreateDriver(driverAddress);
   }
-  Serial.println(F("UART: applying defaults..."));
+  Serial.println(F("Applying TMC defaults..."));
   Serial.flush();
-
   driver->begin();
-  driver->pdn_disable(true);       // PDN pin used for UART
-  driver->I_scale_analog(false);   // digital current via UART
+  driver->pdn_disable(true);
+  driver->I_scale_analog(false);
   driver->toff(5);
   driver->rms_current(rmsMa);
   driver->microsteps(DEFAULT_MICROSTEPS);
   driver->pwm_autoscale(true);
   driver->en_spreadCycle(false);
-
   uint8_t hold = (uint8_t)(driver->irun() * 3 / 10);
   if (hold < 1) {
     hold = 1;
@@ -214,24 +281,7 @@ void applyDriverDefaults() {
   driver->ihold(hold);
   driver->iholddelay(2);
   driverConfigured = true;
-
-  Serial.print(F("Defaults applied at addr "));
-  Serial.println(driverAddress);
-}
-
-void printDriverStatus() {
-  ensureUartPort();
-  if (!driver) {
-    recreateDriver(driverAddress);
-  }
-  Serial.println(F("UART: driver status..."));
-  Serial.flush();
-  Serial.print(F("version=0x"));
-  Serial.print(driver->version(), HEX);
-  Serial.print(F("  microsteps="));
-  Serial.print(driver->microsteps());
-  Serial.print(F("  SG_RESULT="));
-  Serial.println(driver->SG_RESULT());
+  Serial.println(F("Done"));
 }
 
 void setup() {
@@ -240,9 +290,9 @@ void setup() {
   }
   delay(200);
 
-  Serial.println(F("\nUSB serial OK (no TMC UART yet)"));
-  Serial.flush();
-
+  Serial.println(F("\nUSB OK — TMC UART not started"));
+  Serial.println(F("If you previously shorted a driver on this breadboard row:"));
+  Serial.println(F("  move to a NEW area and use NEW jumper wires before UART."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
@@ -252,23 +302,15 @@ void setup() {
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
-  if (!stepper) {
-    Serial.println(F("ERROR: FastAccelStepper could not claim STEP pin"));
-  } else {
+  if (stepper) {
     stepper->setDirectionPin(DIR_PIN, true, 5);
-    if (ENABLE_PIN >= 0) {
-      stepper->setEnablePin(ENABLE_PIN, true);
-      stepper->setAutoEnable(false);
-      stepper->enableOutputs();
-    }
     stepper->setSpeedInHz(DEFAULT_SPEED_HZ);
     stepper->setAcceleration(DEFAULT_ACCEL);
     stepper->setCurrentPosition(0);
   }
 
   printHelp();
-  printMotionStatus();
-  Serial.println(F("Next: t   (or w then t if needed)"));
+  Serial.println(F("Start with: k"));
   Serial.print(F("> "));
   Serial.flush();
 }
@@ -278,10 +320,25 @@ void processCommand(String cmd) {
   if (cmd.length() == 0) {
     return;
   }
-
   const char c = cmd.charAt(0);
 
-  if (c == '+' || c == '-') {
+  if (c == 'h' || c == 'H' || c == '?') {
+    printHelp();
+  } else if (c == 'k' || c == 'K') {
+    checkPinsNotShortedToGnd();
+  } else if (c == 'l' || c == 'L') {
+    loopbackHelp();
+  } else if (c == 'b' || c == 'B') {
+    loopbackByteTest();
+  } else if (c == 't' || c == 'T') {
+    testUart();
+  } else if (c == 'w' || c == 'W') {
+    swapUartPins();
+  } else if (c == 'u' || c == 'U') {
+    applyDriverDefaults();
+  } else if (c == 'p' || c == 'P') {
+    printMotionStatus();
+  } else if (c == '+' || c == '-') {
     int32_t delta = (c == '+') ? stepSize : -stepSize;
     if (cmd.length() > 1) {
       delta = cmd.substring(1).toInt();
@@ -294,7 +351,6 @@ void processCommand(String cmd) {
     }
     Serial.print(F("move "));
     Serial.println(delta);
-    printMotionStatus();
   } else if (c == 'n' || c == 'N') {
     const int32_t v = cmd.substring(1).toInt();
     if (v > 0) {
@@ -310,69 +366,38 @@ void processCommand(String cmd) {
     if (v > 0 && stepper) {
       stepper->setAcceleration(v);
     }
-  } else if (c == 'g' || c == 'G') {
-    if (stepper) {
-      stepper->moveTo(cmd.substring(1).toInt());
-    }
-  } else if (c == 'z' || c == 'Z') {
-    if (stepper) {
-      stepper->setCurrentPosition(0);
-    }
-  } else if (c == 'p' || c == 'P') {
-    printMotionStatus();
-  } else if (c == 'w' || c == 'W') {
-    swapUartPins();
-  } else if (c == 'u' || c == 'U') {
-    applyDriverDefaults();
   } else if (c == 'c' || c == 'C') {
     const int v = cmd.substring(1).toInt();
-    if (v > 0 && v < 2000) {
+    if (v > 0 && v < 2000 && ensureUartPortSafe()) {
       rmsMa = (uint16_t)v;
-      ensureUartPort();
       if (!driver) {
         recreateDriver(driverAddress);
       }
-      Serial.println(F("UART: set current..."));
-      Serial.flush();
       driver->rms_current(rmsMa);
-      uint8_t hold = (uint8_t)(driver->irun() * 3 / 10);
-      if (hold < 1) {
-        hold = 1;
-      }
-      driver->ihold(hold);
-      driverConfigured = true;
       Serial.print(F("rms_mA="));
       Serial.println(rmsMa);
-    } else {
-      Serial.println(F("usage: c 300"));
     }
   } else if (c == 'm' || c == 'M') {
     const int v = cmd.substring(1).toInt();
-    if (v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
-      ensureUartPort();
+    if ((v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) &&
+        ensureUartPortSafe()) {
       if (!driver) {
         recreateDriver(driverAddress);
       }
       driver->microsteps(v);
-      Serial.print(F("microsteps="));
       Serial.println(v);
-    } else {
-      Serial.println(F("usage: m 16"));
     }
-  } else if (c == 't' || c == 'T') {
-    testUart();
   } else if (c == 'i' || c == 'I') {
-    printDriverStatus();
-    printMotionStatus();
+    if (ensureUartPortSafe() && driver) {
+      Serial.print(F("ver=0x"));
+      Serial.println(driver->version(), HEX);
+    }
   } else if (c == 'x' || c == 'X') {
     if (stepper) {
       stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
     }
-    Serial.println(F("STOPPED"));
-  } else if (c == 'h' || c == 'H' || c == '?') {
-    printHelp();
   } else {
-    Serial.println(F("unknown (h for help)"));
+    Serial.println(F("unknown (h)"));
   }
 }
 
