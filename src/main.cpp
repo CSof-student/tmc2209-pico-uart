@@ -17,7 +17,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v8";
+static const char *FW_VERSION = "tmc-uart-v9";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -227,6 +227,7 @@ void softUartIdle() {
 }
 
 void softUartWriteByte(uint8_t b) {
+  noInterrupts();
   // start bit
   digitalWrite(tmcTxPin, LOW);
   delayMicroseconds(SOFT_BIT_US);
@@ -238,6 +239,7 @@ void softUartWriteByte(uint8_t b) {
   // stop bit
   digitalWrite(tmcTxPin, HIGH);
   delayMicroseconds(SOFT_BIT_US);
+  interrupts();
 }
 
 void softUartWriteBytes(const uint8_t *data, uint8_t len) {
@@ -249,12 +251,13 @@ void softUartWriteBytes(const uint8_t *data, uint8_t len) {
 // Returns true and fills `out` if a byte is received within timeoutMs.
 bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
   const uint32_t start = millis();
-  // wait for start bit (HIGH -> LOW)
+  // wait for start bit (HIGH -> LOW) — interrupts OK while waiting
   while (digitalRead(tmcRxPin) == HIGH) {
     if (millis() - start > timeoutMs) {
       return false;
     }
   }
+  noInterrupts();
   // sample mid first data bit: half start + half data
   delayMicroseconds(SOFT_BIT_US + SOFT_BIT_US / 2);
   uint8_t b = 0;
@@ -266,6 +269,7 @@ bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
   }
   // wait out stop bit
   delayMicroseconds(SOFT_BIT_US);
+  interrupts();
   out = b;
   return true;
 }
