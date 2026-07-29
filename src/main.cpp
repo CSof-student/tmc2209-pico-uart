@@ -4,9 +4,9 @@
   If `t` used to freeze: often TX (GP4) is shorted to GND from an old
   breadboard short. This build checks pins BEFORE any Serial1 write.
 
-  Wiring (normal):
+  Wiring (v10):
     GP4 TX -> TMC Rx
-    GP5 RX <- TMC Tx
+    GP1 RX <- TMC Tx   (moved off GP5)
     STEP GP3, DIR GP2, EN->GND
     VIO 3.3V, VM motor PSU, GND common
 */
@@ -17,14 +17,15 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v9";
+static const char *FW_VERSION = "tmc-uart-v10";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
 static const int8_t ENABLE_PIN = -1;
 
-static const uint8_t PIN_A = 4;  // normally TX
-static const uint8_t PIN_B = 5;  // normally RX
+static const uint8_t PIN_A = 4;  // TX -> TMC Rx  (do not use a damaged breadboard column)
+static const uint8_t PIN_B = 1;  // RX <- TMC Tx  (moved off GP5; GP5 was stuck LOW)
+// If you must use GP5 again later, change PIN_B back to 5.
 static const float R_SENSE = 0.11f;
 
 static const uint16_t DEFAULT_RMS_MA = 300;
@@ -81,9 +82,13 @@ bool checkUartPinsSafeToStart() {
   const int txLevel = (tmcTxPin == PIN_A) ? a : b;
   const int rxLevel = (tmcRxPin == PIN_A) ? a : b;
 
-  Serial.print(F("Pin check: GP4="));
+  Serial.print(F("Pin check: GP"));
+  Serial.print(PIN_A);
+  Serial.print(F("="));
   Serial.print(a == HIGH ? F("HIGH") : F("LOW"));
-  Serial.print(F("  GP5="));
+  Serial.print(F("  GP"));
+  Serial.print(PIN_B);
+  Serial.print(F("="));
   Serial.print(b == HIGH ? F("HIGH") : F("LOW"));
   Serial.print(F("  (TX=GP"));
   Serial.print(tmcTxPin);
@@ -322,9 +327,13 @@ void testUart() {
   const int txLevel = (tmcTxPin == PIN_A) ? a : b;
   const int rxLevel = (tmcRxPin == PIN_A) ? a : b;
 
-  Serial.print(F("t: GP4="));
+  Serial.print(F("t: GP"));
+  Serial.print(PIN_A);
+  Serial.print(F("="));
   Serial.print(a == HIGH ? F("H") : F("L"));
-  Serial.print(F(" GP5="));
+  Serial.print(F(" GP"));
+  Serial.print(PIN_B);
+  Serial.print(F("="));
   Serial.print(b == HIGH ? F("H") : F("L"));
   Serial.print(F(" TX=GP"));
   Serial.print(tmcTxPin);
@@ -435,6 +444,7 @@ void setup() {
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
+  Serial.println(F("UART wiring: GP4->TMC Rx,  GP1<-TMC Tx  (GP5 retired; was stuck LOW)"));
   Serial.println(F("t uses software UART (should not freeze)."));
   recreateDriver(0);
 
