@@ -1,16 +1,18 @@
 /*
   Pico + TMC2209 (UART config) + FastAccelStepper (STEP/DIR motion)
 
-  Wiring (see README):
+  Wiring:
     STEP -> GP3
     DIR  -> GP2
-    EN   -> GND (or GP6 if ENABLE_PIN >= 0)
-    UART -> GP4 (TX) + GP5 (RX) with 1k half-duplex network to PDN_UART
+    EN   -> GND (or set ENABLE_PIN)
+    UART -> GP4 (TX) -> TMC Rx ,  GP5 (RX) <- TMC Tx
     VIO  -> 3.3V
     VM   -> motor supply
     GND  -> common
+    CLK  -> leave unconnected
 
   Serial Monitor 115200, Newline. Type h for help.
+  IMPORTANT: do not run t/c/m/i until USB serial responds to h.
 */
 
 #include <Arduino.h>
@@ -22,20 +24,14 @@
 // --- Motion pins ---
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
-// Set to -1 if EN is hard-wired to GND on the driver
-static const int8_t ENABLE_PIN = -1;
+static const int8_t ENABLE_PIN = -1;  // -1 = EN hard-wired to GND
 
-// --- TMC2209 UART pins (Serial1) ---
-static const uint8_t TMC_TX_PIN = 4;  // Pico TX -> 1k -> PDN_UART
-static const uint8_t TMC_RX_PIN = 5;  // Pico RX -> PDN_UART directly
-
-// TMC2209 UART address from MS1/MS2 jumpers (both open/low => 0b00)
+// --- TMC2209 UART (Serial1) ---
+static const uint8_t TMC_TX_PIN = 4;  // Pico TX -> TMC Rx
+static const uint8_t TMC_RX_PIN = 5;  // Pico RX <- TMC Tx
 static const uint8_t DRIVER_ADDRESS = 0b00;
-
-// Sense resistor on most SilentStepStick / BTT TMC2209 modules
 static const float R_SENSE = 0.11f;
 
-// Conservative NEMA-8 starting current (mA RMS). Raise carefully.
 static const uint16_t DEFAULT_RMS_MA = 300;
 static const uint16_t DEFAULT_MICROSTEPS = 16;
 static const uint32_t DEFAULT_SPEED_HZ = 200;
@@ -50,25 +46,28 @@ FastAccelStepper *stepper = nullptr;
 
 int32_t stepSize = DEFAULT_STEP_SIZE;
 uint16_t rmsMa = DEFAULT_RMS_MA;
+bool driverConfigured = false;
 String line;
 
 void printHelp() {
   Serial.println(F("\nCommands:"));
+  Serial.println(F("  h           help (USB only, no TMC UART)"));
+  Serial.println(F("  p           motion status (USB only, no TMC UART)"));
   Serial.println(F("  + / -       nudge +/- stepSize"));
   Serial.println(F("  n <val>     set stepSize"));
   Serial.println(F("  s <hz>      set speed (steps/s)"));
   Serial.println(F("  a <val>     set acceleration"));
   Serial.println(F("  g <pos>     goto absolute position"));
   Serial.println(F("  z           zero position"));
-  Serial.println(F("  c <mA>      set RMS current via UART (e.g. c 350)"));
-  Serial.println(F("  m <usteps>  set microsteps (8,16,32,64,128,256)"));
-  Serial.println(F("  t           UART communication test"));
-  Serial.println(F("  i           print driver + motion status"));
   Serial.println(F("  x           emergency stop"));
-  Serial.println(F("  h           help"));
+  Serial.println(F("  t           UART test (may pause if wiring bad)"));
+  Serial.println(F("  c <mA>      set RMS current via UART"));
+  Serial.println(F("  m <usteps>  set microsteps via UART"));
+  Serial.println(F("  i           driver status via UART"));
+  Serial.println(F("  u           apply default TMC UART settings"));
 }
 
-void printStatus() {
+void printMotionStatus() {
   Serial.print(F("pos="));
   Serial.print(stepper ? stepper->getCurrentPosition() : 0);
   if (stepper) {
@@ -83,43 +82,80 @@ void printStatus() {
   }
   Serial.print(F("  stepSize="));
   Serial.print(stepSize);
-  Serial.print(F("  rms_mA="));
+  Serial.print(F("  rms_mA(setpoint)="));
   Serial.print(rmsMa);
-  Serial.print(F("  microsteps="));
-  Serial.print(driver.microsteps());
-  Serial.print(F("  SG_RESULT="));
-  Serial.println(driver.SG_RESULT());
+  Serial.print(F("  driverConfigured="));
+  Serial.println(driverConfigured ? F("yes") : F("no"));
+}
+
+void ensureUartPort() {
+  static bool started = false;
+  if (started) {
+    return;
+  }
+  SERIAL_PORT.setTX(TMC_TX_PIN);
+  SERIAL_PORT.setRX(TMC_RX_PIN);
+  SERIAL_PORT.begin(115200);
+  delay(20);
+  started = true;
 }
 
 void testUart() {
+  ensureUartPort();
+  Serial.println(F("UART: reading version (if this hangs, fix Rx/Tx wiring / power)"));
+  Serial.flush();
+  delay(10);
+
   const uint8_t ver = driver.version();
-  const uint32_t ifcnt = driver.IFCNT();
+
   Serial.print(F("UART version=0x"));
-  Serial.print(ver, HEX);
-  Serial.print(F("  IFCNT="));
-  Serial.print(ifcnt);
-  Serial.print(F("  -> "));
+  Serial.println(ver, HEX);
+  Serial.flush();
+
   if (ver == 0x21 || ver == 0x20) {
-    Serial.println(F("OK (TMC2209/2208 family responded)"));
+    Serial.println(F("UART -> OK"));
   } else {
-    Serial.println(F("FAIL (check 1k network, address jumpers, VIO, PDN_UART)"));
+    Serial.println(F("UART -> FAIL (expected 0x21). Check:"));
+    Serial.println(F("  Pico GP4 TX -> TMC Rx"));
+    Serial.println(F("  Pico GP5 RX <- TMC Tx"));
+    Serial.println(F("  VIO=3.3V, common GND, EN=GND, VM on"));
   }
 }
 
 void applyDriverDefaults() {
+  ensureUartPort();
+  Serial.println(F("UART: applying driver defaults..."));
+  Serial.flush();
+
   driver.begin();
-  driver.toff(5);                 // enable driver output stage via chopper
-  driver.rms_current(rmsMa);      // digital current (pot not required)
+  driver.toff(5);
+  driver.rms_current(rmsMa);
   driver.microsteps(DEFAULT_MICROSTEPS);
-  driver.pwm_autoscale(true);     // StealthChop
-  driver.en_spreadCycle(false);   // quiet mode
-  // Hold current ~30% of run for less heat when idle
+  driver.pwm_autoscale(true);
+  driver.en_spreadCycle(false);
+
   uint8_t hold = (uint8_t)(driver.irun() * 3 / 10);
   if (hold < 1) {
     hold = 1;
   }
   driver.ihold(hold);
   driver.iholddelay(2);
+  driverConfigured = true;
+
+  Serial.println(F("UART: defaults applied"));
+}
+
+void printDriverStatus() {
+  ensureUartPort();
+  Serial.println(F("UART: reading driver status..."));
+  Serial.flush();
+
+  Serial.print(F("version=0x"));
+  Serial.print(driver.version(), HEX);
+  Serial.print(F("  microsteps="));
+  Serial.print(driver.microsteps());
+  Serial.print(F("  SG_RESULT="));
+  Serial.println(driver.SG_RESULT());
 }
 
 void setup() {
@@ -128,45 +164,38 @@ void setup() {
   }
   delay(200);
 
+  // USB first — never touch TMC UART during boot so `h` always works.
+  Serial.println(F("\nUSB serial OK"));
+  Serial.println(F("TMC UART is NOT initialized yet. Try: h"));
+  Serial.flush();
+
   if (ENABLE_PIN >= 0) {
     pinMode(ENABLE_PIN, OUTPUT);
-    digitalWrite(ENABLE_PIN, LOW);  // TMC EN is active low
+    digitalWrite(ENABLE_PIN, LOW);
   }
-
-  // Hardware UART to TMC2209 single-wire interface
-  SERIAL_PORT.setTX(TMC_TX_PIN);
-  SERIAL_PORT.setRX(TMC_RX_PIN);
-  SERIAL_PORT.begin(115200);
-  delay(50);
-
-  applyDriverDefaults();
 
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
   if (!stepper) {
     Serial.println(F("ERROR: FastAccelStepper could not claim STEP pin"));
-    while (true) {
-      delay(1000);
+  } else {
+    stepper->setDirectionPin(DIR_PIN, true, 5);
+    if (ENABLE_PIN >= 0) {
+      stepper->setEnablePin(ENABLE_PIN, true);
+      stepper->setAutoEnable(false);
+      stepper->enableOutputs();
     }
+    stepper->setSpeedInHz(DEFAULT_SPEED_HZ);
+    stepper->setAcceleration(DEFAULT_ACCEL);
+    stepper->setCurrentPosition(0);
   }
 
-  stepper->setDirectionPin(DIR_PIN, /*dirHighCountsUp=*/true, /*dir_change_delay_us=*/5);
-  if (ENABLE_PIN >= 0) {
-    stepper->setEnablePin(ENABLE_PIN, /*low_active_enables=*/true);
-    stepper->setAutoEnable(false);
-    stepper->enableOutputs();
-  }
-
-  stepper->setSpeedInHz(DEFAULT_SPEED_HZ);
-  stepper->setAcceleration(DEFAULT_ACCEL);
-  stepper->setCurrentPosition(0);
-
-  Serial.println(F("\nTMC2209 UART + FastAccelStepper ready."));
   Serial.println(F("STEP=GP3 DIR=GP2  UART TX=GP4 RX=GP5"));
-  testUart();
   printHelp();
-  printStatus();
+  printMotionStatus();
+  Serial.println(F("Next: h  then  t  (only after h works)"));
   Serial.print(F("> "));
+  Serial.flush();
 }
 
 void processCommand(String cmd) {
@@ -190,6 +219,7 @@ void processCommand(String cmd) {
     }
     Serial.print(F("move "));
     Serial.println(delta);
+    printMotionStatus();
   } else if (c == 'n' || c == 'N') {
     const int32_t v = cmd.substring(1).toInt();
     if (v > 0) {
@@ -218,21 +248,30 @@ void processCommand(String cmd) {
     }
     Serial.print(F("goto "));
     Serial.println(pos);
+    printMotionStatus();
   } else if (c == 'z' || c == 'Z') {
     if (stepper) {
       stepper->setCurrentPosition(0);
     }
     Serial.println(F("position zeroed"));
+  } else if (c == 'p' || c == 'P') {
+    printMotionStatus();
+  } else if (c == 'u' || c == 'U') {
+    applyDriverDefaults();
   } else if (c == 'c' || c == 'C') {
     const int v = cmd.substring(1).toInt();
     if (v > 0 && v < 2000) {
       rmsMa = (uint16_t)v;
+      ensureUartPort();
+      Serial.println(F("UART: setting current..."));
+      Serial.flush();
       driver.rms_current(rmsMa);
       uint8_t hold = (uint8_t)(driver.irun() * 3 / 10);
       if (hold < 1) {
         hold = 1;
       }
       driver.ihold(hold);
+      driverConfigured = true;
       Serial.print(F("rms_current_mA="));
       Serial.println(rmsMa);
     } else {
@@ -241,16 +280,20 @@ void processCommand(String cmd) {
   } else if (c == 'm' || c == 'M') {
     const int v = cmd.substring(1).toInt();
     if (v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
+      ensureUartPort();
+      Serial.println(F("UART: setting microsteps..."));
+      Serial.flush();
       driver.microsteps(v);
-      Serial.print(F("microsteps="));
-      Serial.println(driver.microsteps());
+      Serial.print(F("microsteps command sent: "));
+      Serial.println(v);
     } else {
       Serial.println(F("usage: m <8|16|32|64|128|256>"));
     }
   } else if (c == 't' || c == 'T') {
     testUart();
   } else if (c == 'i' || c == 'I') {
-    printStatus();
+    printDriverStatus();
+    printMotionStatus();
   } else if (c == 'x' || c == 'X') {
     if (stepper) {
       stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
@@ -261,8 +304,6 @@ void processCommand(String cmd) {
   } else {
     Serial.println(F("unknown command (h for help)"));
   }
-
-  printStatus();
 }
 
 void loop() {
@@ -273,6 +314,7 @@ void loop() {
         processCommand(line);
         line = "";
         Serial.print(F("> "));
+        Serial.flush();
       }
     } else {
       line += ch;
