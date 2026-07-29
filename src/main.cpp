@@ -17,6 +17,8 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
+static const char *FW_VERSION = "tmc-uart-v8";
+
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
 static const int8_t ENABLE_PIN = -1;
@@ -125,15 +127,15 @@ bool ensureUartPortSafe() {
 
 void printHelp() {
   Serial.println(F("\nCommands (safe ones first):"));
+  Serial.println(F("  v   print firmware version (always safe)"));
   Serial.println(F("  h   help"));
   Serial.println(F("  k   pin short check (do this first)"));
   Serial.println(F("  l   UART loopback hint / test helpers"));
-  Serial.println(F("  t   TMC version scan (timed, no Serial1.flush)"));
+  Serial.println(F("  t   TMC probe via software UART @9600 (no Serial1)"));
   Serial.println(F("  w   swap TX/RX — ONLY if TX pin was LOW"));
-  Serial.println(F("      If RX was LOW, do not swap (that caused the freeze)"));
-  Serial.println(F("  u   apply TMC defaults"));
+  Serial.println(F("      If RX was LOW, do not swap"));
+  Serial.println(F("  u   apply TMC defaults (uses Serial1 — may hang if bus bad)"));
   Serial.println(F("  c/m/i/+/- /p/x   current/microsteps/status/move/..."));
-  Serial.println(F("\nAfter a shorted driver: rewire on a FRESH breadboard section."));
 }
 
 void printMotionStatus() {
@@ -215,90 +217,127 @@ uint8_t tmcCrc(const uint8_t *data, uint8_t len) {
   return crc;
 }
 
-// Timed TX that never calls flush() — flush can hang forever if TX fights the bus.
-bool writeBytesNoFlush(const uint8_t *data, uint8_t len, uint32_t timeoutMs) {
+// Software UART @ 9600 — never touches Serial1, so it cannot hang the HW UART FIFO.
+static const uint16_t SOFT_BIT_US = 104;  // 1/9600 ≈ 104 µs
+
+void softUartIdle() {
+  pinMode(tmcTxPin, OUTPUT);
+  digitalWrite(tmcTxPin, HIGH);
+  pinMode(tmcRxPin, INPUT_PULLUP);
+}
+
+void softUartWriteByte(uint8_t b) {
+  // start bit
+  digitalWrite(tmcTxPin, LOW);
+  delayMicroseconds(SOFT_BIT_US);
+  for (uint8_t i = 0; i < 8; i++) {
+    digitalWrite(tmcTxPin, (b & 0x01) ? HIGH : LOW);
+    delayMicroseconds(SOFT_BIT_US);
+    b >>= 1;
+  }
+  // stop bit
+  digitalWrite(tmcTxPin, HIGH);
+  delayMicroseconds(SOFT_BIT_US);
+}
+
+void softUartWriteBytes(const uint8_t *data, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++) {
+    softUartWriteByte(data[i]);
+  }
+}
+
+// Returns true and fills `out` if a byte is received within timeoutMs.
+bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
   const uint32_t start = millis();
-  uint8_t i = 0;
-  while (i < len) {
+  // wait for start bit (HIGH -> LOW)
+  while (digitalRead(tmcRxPin) == HIGH) {
     if (millis() - start > timeoutMs) {
       return false;
     }
-    if (SERIAL_PORT.availableForWrite() > 0) {
-      SERIAL_PORT.write(data[i++]);
-    } else {
-      delay(1);
+  }
+  // sample mid first data bit: half start + half data
+  delayMicroseconds(SOFT_BIT_US + SOFT_BIT_US / 2);
+  uint8_t b = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (digitalRead(tmcRxPin)) {
+      b |= (uint8_t)(1u << i);
+    }
+    delayMicroseconds(SOFT_BIT_US);
+  }
+  // wait out stop bit
+  delayMicroseconds(SOFT_BIT_US);
+  out = b;
+  return true;
+}
+
+bool softUartReadBytes(uint8_t *data, uint8_t len, uint32_t firstTimeoutMs, uint32_t nextTimeoutMs) {
+  for (uint8_t i = 0; i < len; i++) {
+    if (!softUartReadByte(data[i], i == 0 ? firstTimeoutMs : nextTimeoutMs)) {
+      return false;
     }
   }
   return true;
 }
 
-bool readBytesTimed(uint8_t *data, uint8_t len, uint32_t timeoutMs) {
-  const uint32_t start = millis();
-  uint8_t i = 0;
-  while (i < len) {
-    if (millis() - start > timeoutMs) {
-      return false;
-    }
-    if (SERIAL_PORT.available()) {
-      data[i++] = (uint8_t)SERIAL_PORT.read();
-    } else {
-      delay(1);
-    }
-  }
-  return true;
-}
+uint8_t probeVersionSoft(uint8_t addr) {
+  softUartIdle();
+  delay(2);
 
-// Returns version byte or 0xFF on timeout/fail. Does not use TMCStepper (avoids flush hang).
-uint8_t probeVersionRaw(uint8_t addr) {
-  while (SERIAL_PORT.available()) {
-    SERIAL_PORT.read();
-  }
-
-  // Read request for register 0x06 (IOIN) — reply includes version in bits 31..24 of IOIN payload.
-  // Simpler: read GCONF 0x00 also works; TMCStepper uses IFCNT/IOIN. Use IOIN 0x06.
   uint8_t req[4];
-  req[0] = 0x05;                  // sync
-  req[1] = (uint8_t)(addr & 0x03); // slave addr, read bit=0
-  req[2] = 0x06;                  // IOIN
+  req[0] = 0x05;
+  req[1] = (uint8_t)(addr & 0x03);
+  req[2] = 0x06;  // IOIN
   req[3] = tmcCrc(req, 3);
 
-  if (!writeBytesNoFlush(req, 4, 50)) {
-    Serial.print(F("tx-timeout "));
-    return 0xFF;
-  }
-
-  // Give the driver a moment; do NOT flush.
-  delay(5);
+  softUartWriteBytes(req, 4);
 
   uint8_t resp[8];
-  if (!readBytesTimed(resp, 8, 100)) {
-    return 0x00;  // no reply
+  if (!softUartReadBytes(resp, 8, 100, 30)) {
+    return 0x00;
   }
-
-  // Reply: sync, addr|0xFF master, reg, data0..data3, crc
-  // IOIN version is in data3 (byte index 6) for TMC2209
   if (resp[0] != 0x05) {
     return 0x00;
   }
-  return resp[6];
+  return resp[6];  // IOIN version field
 }
 
 void testUart() {
-  Serial.println(F("Pre-check before TMC UART..."));
-  Serial.flush();  // USB Serial flush is fine
-  stopUartPort();
+  Serial.println(F("t: software UART probe @9600 (Serial1 NOT used)"));
+  Serial.flush();
 
-  if (!ensureUartPortSafe()) {
-    Serial.println(F("Aborting t."));
-    Serial.println(F("If RX was the LOW pin, do NOT swap — stay TX=GP4 RX=GP5 and retry t."));
-    return;
-  }
+  stopUartPort();  // make sure HW UART is off so pins are free
+  Serial.println(F("t: HW UART released"));
+  Serial.flush();
 
-  Serial.println(F("Scanning addrs 0..3 with timed UART (no flush, cannot hang on TX)."));
-  Serial.print(F("TX=GP"));
+  // Pin check only — do not call Serial1.begin
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
+  delay(5);
+  const int a = digitalRead(PIN_A);
+  const int b = digitalRead(PIN_B);
+  const int txLevel = (tmcTxPin == PIN_A) ? a : b;
+  const int rxLevel = (tmcRxPin == PIN_A) ? a : b;
+
+  Serial.print(F("t: GP4="));
+  Serial.print(a == HIGH ? F("H") : F("L"));
+  Serial.print(F(" GP5="));
+  Serial.print(b == HIGH ? F("H") : F("L"));
+  Serial.print(F(" TX=GP"));
   Serial.print(tmcTxPin);
   Serial.print(F(" RX=GP"));
   Serial.println(tmcRxPin);
+  Serial.flush();
+
+  if (txLevel == LOW) {
+    Serial.println(F("t: ABORT — TX pin LOW. Do not transmit. Try w only if this is TX."));
+    return;
+  }
+  if (rxLevel == LOW) {
+    Serial.println(F("t: RX LOW (often OK). Continuing with soft UART."));
+  }
+
+  softUartIdle();
+  Serial.println(F("t: scanning addrs 0..3 ..."));
   Serial.flush();
 
   int found = -1;
@@ -309,8 +348,8 @@ void testUart() {
     Serial.print(F(": "));
     Serial.flush();
 
-    const uint8_t ver = probeVersionRaw(addr);
-    Serial.print(F("version=0x"));
+    const uint8_t ver = probeVersionSoft(addr);
+    Serial.print(F("0x"));
     Serial.print(ver, HEX);
 
     if (ver == 0x21 || ver == 0x20) {
@@ -319,28 +358,23 @@ void testUart() {
       foundVer = ver;
       break;
     }
-    if (ver == 0xFF) {
-      Serial.println(F(" TX stuck/timeout — unswap with w if you swapped"));
-      break;
-    }
     Serial.println(F(" fail"));
+    Serial.flush();
   }
 
-  // Always release UART hardware after probe so a bad bus can't keep wedging later.
-  stopUartPort();
+  pinMode(tmcTxPin, INPUT_PULLUP);
+  pinMode(tmcRxPin, INPUT_PULLUP);
 
   if (found >= 0) {
     recreateDriver((uint8_t)found);
-    Serial.print(F("Using addr "));
+    Serial.print(F("t: OK addr="));
     Serial.print(found);
-    Serial.print(F(" ver=0x"));
+    Serial.print(F(" chip_ver=0x"));
     Serial.println(foundVer, HEX);
-    Serial.println(F("Next: u"));
   } else {
-    Serial.println(F("No TMC response."));
-    Serial.println(F("Tip: LOW on GP5 (RX) is normal — use default TX=GP4, do not swap."));
-    Serial.println(F("     Swap only if GP4 (TX) was LOW."));
+    Serial.println(F("t: no response (wiring/VIO/EN/addr) — but should NOT freeze anymore"));
   }
+  Serial.flush();
 }
 
 void swapUartPins() {
@@ -393,10 +427,11 @@ void setup() {
   }
   delay(200);
 
-  Serial.println(F("=== FW tmc-uart-v7 ==="));
-  Serial.println(F("USB OK — TMC UART not started"));
-  Serial.println(F("If RX pin was LOW: do NOT swap. Freeze was likely TX fighting TMC Tx."));
-  Serial.println(F("Safe UART probe: timed writes, never Serial1.flush to TMC."));
+  Serial.print(F("=== FW "));
+  Serial.print(FW_VERSION);
+  Serial.println(F(" ==="));
+  Serial.println(F("Type v anytime to print firmware version."));
+  Serial.println(F("t uses software UART (should not freeze)."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
@@ -428,6 +463,9 @@ void processCommand(String cmd) {
 
   if (c == 'h' || c == 'H' || c == '?') {
     printHelp();
+  } else if (c == 'v' || c == 'V') {
+    Serial.print(F("firmware="));
+    Serial.println(FW_VERSION);
   } else if (c == 'k' || c == 'K') {
     checkUartPinsSafeToStart();
   } else if (c == 'l' || c == 'L') {
