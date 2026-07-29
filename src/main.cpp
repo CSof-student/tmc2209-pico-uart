@@ -64,8 +64,9 @@ void stopUartPort() {
   pinMode(PIN_B, INPUT);
 }
 
-// Returns false if a pin looks shorted to GND — do NOT start UART.
-bool checkPinsNotShortedToGnd() {
+// Returns false only if the TX pin looks stuck LOW (unsafe to transmit into).
+// RX may read LOW when the TMC is attached (module pulldown) — that is OK.
+bool checkUartPinsSafeToStart() {
   stopUartPort();
   delay(5);
 
@@ -75,21 +76,31 @@ bool checkPinsNotShortedToGnd() {
 
   const int a = digitalRead(PIN_A);
   const int b = digitalRead(PIN_B);
+  const int txLevel = (tmcTxPin == PIN_A) ? a : b;
+  const int rxLevel = (tmcRxPin == PIN_A) ? a : b;
 
-  Serial.print(F("Pin check (INPUT_PULLUP): GP4="));
+  Serial.print(F("Pin check: GP4="));
   Serial.print(a == HIGH ? F("HIGH") : F("LOW"));
   Serial.print(F("  GP5="));
-  Serial.println(b == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(b == HIGH ? F("HIGH") : F("LOW"));
+  Serial.print(F("  (TX=GP"));
+  Serial.print(tmcTxPin);
+  Serial.print(F(" RX=GP"));
+  Serial.print(tmcRxPin);
+  Serial.println(F(")"));
 
-  if (a == LOW || b == LOW) {
-    Serial.println(F("FAIL: pin stuck LOW = short to GND (or TMC holding line down)."));
-    Serial.println(F("  1) Unplug TMC UART wires and run k again"));
-    Serial.println(F("  2) Move driver to a NEW breadboard area / fresh jumper wires"));
-    Serial.println(F("  3) If still LOW with nothing attached, Pico GPIO may be damaged"));
+  if (txLevel == LOW) {
+    Serial.println(F("UNSAFE: TX pin is LOW — do not start UART (would drive into a low/short)."));
+    Serial.println(F("  Try: w  (swap so the LOW line is RX), then k/t again"));
+    Serial.println(F("  Or disconnect TMC; if TX pin still LOW, breadboard/Pico issue"));
     return false;
   }
 
-  Serial.println(F("Pin check OK (both float HIGH with pullups)"));
+  if (rxLevel == LOW) {
+    Serial.println(F("OK-ish: RX is LOW with TMC attached (common pulldown). Safe to try UART."));
+  } else {
+    Serial.println(F("Pin check OK for UART start (TX is HIGH)."));
+  }
   return true;
 }
 
@@ -97,7 +108,7 @@ bool ensureUartPortSafe() {
   if (uartPortStarted) {
     return true;
   }
-  if (!checkPinsNotShortedToGnd()) {
+  if (!checkUartPinsSafeToStart()) {
     return false;
   }
 
@@ -117,8 +128,8 @@ void printHelp() {
   Serial.println(F("  h   help"));
   Serial.println(F("  k   pin short check (do this first)"));
   Serial.println(F("  l   UART loopback hint / test helpers"));
-  Serial.println(F("  t   TMC version scan (only if k passes)"));
-  Serial.println(F("  w   swap TX/RX mapping"));
+  Serial.println(F("  t   TMC version scan (safe: only needs TX pin HIGH)"));
+  Serial.println(F("  w   swap TX/RX mapping (use if TX pin is the LOW one)"));
   Serial.println(F("  u   apply TMC defaults"));
   Serial.println(F("  c/m/i/+/- /p/x   current/microsteps/status/move/..."));
   Serial.println(F("\nAfter a shorted driver: rewire on a FRESH breadboard section."));
@@ -145,7 +156,7 @@ void loopbackHelp() {
 
 void loopbackByteTest() {
   stopUartPort();
-  if (!checkPinsNotShortedToGnd()) {
+  if (!checkUartPinsSafeToStart()) {
     return;
   }
 
@@ -290,9 +301,10 @@ void setup() {
   }
   delay(200);
 
-  Serial.println(F("\nUSB OK — TMC UART not started"));
-  Serial.println(F("If you previously shorted a driver on this breadboard row:"));
-  Serial.println(F("  move to a NEW area and use NEW jumper wires before UART."));
+  Serial.println(F("=== FW tmc-uart-v6 ==="));
+  Serial.println(F("USB OK — TMC UART not started"));
+  Serial.println(F("If you see endless 200200200, you are NOT running this firmware."));
+  Serial.println(F("Safe UART: will not transmit if TX pin is stuck LOW."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
@@ -325,7 +337,7 @@ void processCommand(String cmd) {
   if (c == 'h' || c == 'H' || c == '?') {
     printHelp();
   } else if (c == 'k' || c == 'K') {
-    checkPinsNotShortedToGnd();
+    checkUartPinsSafeToStart();
   } else if (c == 'l' || c == 'L') {
     loopbackHelp();
   } else if (c == 'b' || c == 'B') {
