@@ -1,14 +1,13 @@
 /*
   Pico + TMC2209 UART diagnostics + FastAccelStepper
 
-  If `t` used to freeze: often TX (GP4) is shorted to GND from an old
-  breadboard short. This build checks pins BEFORE any Serial1 write.
-
-  Wiring (v10):
-    GP4 TX -> TMC Rx
-    GP1 RX <- TMC Tx   (moved off GP5)
+  Wiring (v11):
+    GP8 TX -> TMC Rx
+    GP9 RX <- TMC Tx
     STEP GP3, DIR GP2, EN->GND
     VIO 3.3V, VM motor PSU, GND common
+
+  Avoid GP0/GP1 (default Serial1) and GP5 (stuck LOW on your breadboard).
 */
 
 #include <Arduino.h>
@@ -17,15 +16,15 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v10";
+static const char *FW_VERSION = "tmc-uart-v11";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
 static const int8_t ENABLE_PIN = -1;
 
-static const uint8_t PIN_A = 4;  // TX -> TMC Rx  (do not use a damaged breadboard column)
-static const uint8_t PIN_B = 1;  // RX <- TMC Tx  (moved off GP5; GP5 was stuck LOW)
-// If you must use GP5 again later, change PIN_B back to 5.
+// Soft/HW UART pins — keep off GP0/GP1 (UART0 defaults) and off damaged GP5 column
+static const uint8_t PIN_A = 8;  // TX -> TMC Rx
+static const uint8_t PIN_B = 9;  // RX <- TMC Tx
 static const float R_SENSE = 0.11f;
 
 static const uint16_t DEFAULT_RMS_MA = 300;
@@ -63,8 +62,12 @@ void stopUartPort() {
     delay(10);
     uartPortStarted = false;
   }
+  // Fully release both pins as high-Z inputs (no leftover UART/GPIO drive)
   pinMode(PIN_A, INPUT);
   pinMode(PIN_B, INPUT);
+  delay(1);
+  pinMode(PIN_A, INPUT_PULLUP);
+  pinMode(PIN_B, INPUT_PULLUP);
 }
 
 // Returns false only if the TX pin looks stuck LOW (unsafe to transmit into).
@@ -157,7 +160,7 @@ void printMotionStatus() {
 void loopbackHelp() {
   Serial.println(F("\nLoopback test (TMC UART wires DISCONNECTED):"));
   Serial.println(F("  1) Run k  — both pins must be HIGH"));
-  Serial.println(F("  2) Jumper GP4 directly to GP5"));
+  Serial.println(F("  2) Jumper GP8 directly to GP9"));
   Serial.println(F("  3) Run b  — should echo a byte OK"));
   Serial.println(F("  4) Remove jumper, reconnect to TMC Rx/Tx, run k then t"));
 }
@@ -168,7 +171,7 @@ void loopbackByteTest() {
     return;
   }
 
-  // User should have GP4 jumpered to GP5 for this test
+  // User should have GP8 jumpered to GP9 for this test
   SERIAL_PORT.setTX(tmcTxPin);
   SERIAL_PORT.setRX(tmcRxPin);
   SERIAL_PORT.begin(115200);
@@ -178,7 +181,7 @@ void loopbackByteTest() {
     SERIAL_PORT.read();
   }
 
-  Serial.println(F("Loopback: writing 0xA5 (GP4 must be jumpered to GP5)..."));
+  Serial.println(F("Loopback: writing 0xA5 (GP8 must be jumpered to GP9)..."));
   Serial.flush();
 
   SERIAL_PORT.write((uint8_t)0xA5);
@@ -444,7 +447,7 @@ void setup() {
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
-  Serial.println(F("UART wiring: GP4->TMC Rx,  GP1<-TMC Tx  (GP5 retired; was stuck LOW)"));
+  Serial.println(F("UART wiring: GP8->TMC Rx,  GP9<-TMC Tx"));
   Serial.println(F("t uses software UART (should not freeze)."));
   recreateDriver(0);
 
