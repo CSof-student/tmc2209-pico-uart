@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v11";
+static const char *FW_VERSION = "tmc-uart-v13";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -107,7 +107,8 @@ bool checkUartPinsSafeToStart() {
   }
 
   if (rxLevel == LOW) {
-    Serial.println(F("OK-ish: RX is LOW with TMC attached (common pulldown). Safe to try UART."));
+    Serial.println(F("RX reads LOW. If meter shows ~1.2V on GP9, add pull-up to 3.3V."));
+    Serial.println(F("  Need idle >~2.0V for Pico to see HIGH."));
   } else {
     Serial.println(F("Pin check OK for UART start (TX is HIGH)."));
   }
@@ -157,55 +158,43 @@ void printMotionStatus() {
   Serial.println(uartPinsSwapped ? F("yes") : F("no"));
 }
 
+// Soft UART helpers (defined below) — used by b/t so Serial1 is never required for diagnostics.
+void softUartIdle();
+void softUartWriteByte(uint8_t b);
+bool softUartReadByte(uint8_t &out, uint32_t timeoutMs);
+
 void loopbackHelp() {
   Serial.println(F("\nLoopback test (TMC UART wires DISCONNECTED):"));
   Serial.println(F("  1) Run k  — both pins must be HIGH"));
   Serial.println(F("  2) Jumper GP8 directly to GP9"));
-  Serial.println(F("  3) Run b  — should echo a byte OK"));
-  Serial.println(F("  4) Remove jumper, reconnect to TMC Rx/Tx, run k then t"));
+  Serial.println(F("  3) Run b  — soft-UART echo (no Serial1; should not freeze)"));
+  Serial.println(F("  4) Remove jumper, reconnect to TMC, run k then t"));
 }
 
 void loopbackByteTest() {
-  stopUartPort();
+  stopUartPort();  // release Serial1 if it was left on
   if (!checkUartPinsSafeToStart()) {
     return;
   }
 
-  // User should have GP8 jumpered to GP9 for this test
-  SERIAL_PORT.setTX(tmcTxPin);
-  SERIAL_PORT.setRX(tmcRxPin);
-  SERIAL_PORT.begin(115200);
-  uartPortStarted = true;
-  delay(20);
-  while (SERIAL_PORT.available()) {
-    SERIAL_PORT.read();
-  }
-
-  Serial.println(F("Loopback: writing 0xA5 (GP8 must be jumpered to GP9)..."));
+  Serial.println(F("Loopback: soft UART 0xA5 (GP8 must be jumpered to GP9)..."));
   Serial.flush();
 
-  SERIAL_PORT.write((uint8_t)0xA5);
-  SERIAL_PORT.flush();
+  softUartIdle();
+  delay(2);
+  softUartWriteByte(0xA5);
 
-  const uint32_t start = millis();
-  int got = -1;
-  while (millis() - start < 200) {
-    if (SERIAL_PORT.available()) {
-      got = SERIAL_PORT.read();
-      break;
-    }
-    delay(1);
-  }
-
-  if (got == 0xA5) {
-    Serial.println(F("Loopback OK — Pico UART pins work"));
+  uint8_t got = 0;
+  if (softUartReadByte(got, 50) && got == 0xA5) {
+    Serial.println(F("Loopback OK — Pico GP8/GP9 can talk (Serial1 not used)"));
   } else {
-    Serial.print(F("Loopback FAIL (got "));
-    Serial.print(got);
-    Serial.println(F("). Pins/wiring/Serial1 problem — do not run t yet"));
+    Serial.print(F("Loopback FAIL (got 0x"));
+    Serial.print(got, HEX);
+    Serial.println(F("). Check jumper GP8-GP9; do not run t yet"));
   }
 
-  stopUartPort();
+  pinMode(tmcTxPin, INPUT_PULLUP);
+  pinMode(tmcRxPin, INPUT_PULLUP);
 }
 
 // TMC2209 uses an 8-bit CRC (same polynomial as TMCStepper).
@@ -448,6 +437,8 @@ void setup() {
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
   Serial.println(F("UART wiring: GP8->TMC Rx,  GP9<-TMC Tx"));
+  Serial.println(F("IMPORTANT: add 1k-4.7k pull-up from GP9 to 3.3V"));
+  Serial.println(F("  (TMC Tx often idles ~1.2V without it -> reads LOW, UART fails)"));
   Serial.println(F("t uses software UART (should not freeze)."));
   recreateDriver(0);
 
