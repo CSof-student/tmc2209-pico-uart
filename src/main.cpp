@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v13";
+static const char *FW_VERSION = "tmc-uart-v14";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -34,6 +34,9 @@ static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 8;
 
 #define SERIAL_PORT Serial1
+
+// 1/9600 ≈ 104 µs — used by soft UART loopback + TMC probe
+static const uint16_t SOFT_BIT_US = 104;
 
 uint8_t tmcTxPin = PIN_A;
 uint8_t tmcRxPin = PIN_B;
@@ -177,20 +180,41 @@ void loopbackByteTest() {
     return;
   }
 
-  Serial.println(F("Loopback: soft UART 0xA5 (GP8 must be jumpered to GP9)..."));
+  Serial.println(F("Loopback: soft UART 0xA5 (GP8 jumpered to GP9; TMC UART wires OFF)..."));
   Serial.flush();
 
-  softUartIdle();
-  delay(2);
-  softUartWriteByte(0xA5);
-
+  // Must sample RX *during* TX — after writeByte() returns, the echo is already gone.
+  const uint8_t sent = 0xA5;
   uint8_t got = 0;
-  if (softUartReadByte(got, 50) && got == 0xA5) {
-    Serial.println(F("Loopback OK — Pico GP8/GP9 can talk (Serial1 not used)"));
+  pinMode(tmcTxPin, OUTPUT);
+  digitalWrite(tmcTxPin, HIGH);
+  pinMode(tmcRxPin, INPUT_PULLUP);
+  delay(1);
+
+  noInterrupts();
+  digitalWrite(tmcTxPin, LOW);  // start bit
+  delayMicroseconds(SOFT_BIT_US);
+  for (uint8_t i = 0; i < 8; i++) {
+    digitalWrite(tmcTxPin, (sent >> i) & 0x01);
+    delayMicroseconds(SOFT_BIT_US / 2);
+    if (digitalRead(tmcRxPin)) {
+      got |= (uint8_t)(1u << i);
+    }
+    delayMicroseconds(SOFT_BIT_US - SOFT_BIT_US / 2);
+  }
+  digitalWrite(tmcTxPin, HIGH);  // stop bit
+  delayMicroseconds(SOFT_BIT_US);
+  interrupts();
+
+  if (got == sent) {
+    Serial.println(F("Loopback OK — Pico GP8/GP9 jumper path works"));
   } else {
-    Serial.print(F("Loopback FAIL (got 0x"));
+    Serial.print(F("Loopback FAIL (sent 0xA5 got 0x"));
     Serial.print(got, HEX);
-    Serial.println(F("). Check jumper GP8-GP9; do not run t yet"));
+    Serial.println(F(")."));
+    Serial.println(F("  - Disconnect TMC RX/TX from GP8/GP9"));
+    Serial.println(F("  - Jumper GP8 directly to GP9 (same breadboard row)"));
+    Serial.println(F("  - Run k (both HIGH), then b again"));
   }
 
   pinMode(tmcTxPin, INPUT_PULLUP);
@@ -215,8 +239,6 @@ uint8_t tmcCrc(const uint8_t *data, uint8_t len) {
 }
 
 // Software UART @ 9600 — never touches Serial1, so it cannot hang the HW UART FIFO.
-static const uint16_t SOFT_BIT_US = 104;  // 1/9600 ≈ 104 µs
-
 void softUartIdle() {
   pinMode(tmcTxPin, OUTPUT);
   digitalWrite(tmcTxPin, HIGH);
