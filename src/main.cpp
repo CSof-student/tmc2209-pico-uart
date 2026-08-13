@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v17";
+static const char *FW_VERSION = "tmc-uart-v18";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -164,7 +164,7 @@ void printMotionStatus() {
 // Soft UART helpers (defined below) — used by b/t so Serial1 is never required for diagnostics.
 void softUartIdle();
 void softUartWriteByte(uint8_t b);
-bool softUartReadByte(uint8_t &out, uint32_t timeoutMs);
+bool softUartReadByte(uint8_t &out, uint32_t timeoutMs, bool requireIdleHigh = true);
 
 void loopbackHelp() {
   Serial.println(F("\nLoopback test (TMC UART wires DISCONNECTED):"));
@@ -275,21 +275,25 @@ void softUartWriteBytes(const uint8_t *data, uint8_t len) {
 }
 
 // Returns true and fills `out` if a byte is received within timeoutMs.
-// Requires a real idle-HIGH then falling edge (line already LOW ≠ a start bit).
-bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
+// requireIdleHigh: first byte of a datagram must see HIGH then falling edge.
+// For later bytes in the same datagram, use false — next start may already be LOW.
+bool softUartReadByte(uint8_t &out, uint32_t timeoutMs, bool requireIdleHigh) {
   const uint32_t start = millis();
 
-  // 1) Must see idle HIGH first
-  while (digitalRead(tmcRxPin) == LOW) {
-    if (millis() - start > timeoutMs) {
-      return false;
+  if (requireIdleHigh) {
+    while (digitalRead(tmcRxPin) == LOW) {
+      if (millis() - start > timeoutMs) {
+        return false;
+      }
     }
   }
 
-  // 2) Wait for falling edge (start bit)
-  while (digitalRead(tmcRxPin) == HIGH) {
-    if (millis() - start > timeoutMs) {
-      return false;
+  // Wait for falling edge (start bit). If already LOW, that is the start bit.
+  if (digitalRead(tmcRxPin) == HIGH) {
+    while (digitalRead(tmcRxPin) == HIGH) {
+      if (millis() - start > timeoutMs) {
+        return false;
+      }
     }
   }
 
@@ -312,7 +316,7 @@ bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
 
 bool softUartReadBytes(uint8_t *data, uint8_t len, uint32_t firstTimeoutMs, uint32_t nextTimeoutMs) {
   for (uint8_t i = 0; i < len; i++) {
-    if (!softUartReadByte(data[i], i == 0 ? firstTimeoutMs : nextTimeoutMs)) {
+    if (!softUartReadByte(data[i], i == 0 ? firstTimeoutMs : nextTimeoutMs, i == 0)) {
       return false;
     }
   }
@@ -350,13 +354,13 @@ uint8_t probeVersionSoft(uint8_t addr) {
     delayMicroseconds(200);
   }
 
-  // Hunt for reply sync 0x05, then read the remaining 7 bytes.
+  // Hunt for reply sync 0x05, then read the remaining 7 bytes tightly.
   uint8_t resp[8];
   uint8_t sync = 0;
   bool gotSync = false;
   const uint32_t huntStart = millis();
   while (millis() - huntStart < 200) {
-    if (!softUartReadByte(sync, 50)) {
+    if (!softUartReadByte(sync, 50, true)) {
       continue;
     }
     if (sync == 0x05) {
@@ -373,7 +377,8 @@ uint8_t probeVersionSoft(uint8_t addr) {
   resp[0] = 0x05;
   uint8_t got = 1;
   for (; got < 8; got++) {
-    if (!softUartReadByte(resp[got], 40)) {
+    // Later bytes: do NOT require idle-high first (avoids dropping back-to-back UART bytes)
+    if (!softUartReadByte(resp[got], 20, false)) {
       break;
     }
   }
