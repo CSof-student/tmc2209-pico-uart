@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v14";
+static const char *FW_VERSION = "tmc-uart-v15";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -239,24 +239,30 @@ uint8_t tmcCrc(const uint8_t *data, uint8_t len) {
 }
 
 // Software UART @ 9600 — never touches Serial1, so it cannot hang the HW UART FIFO.
+// Single-wire (PDN/UART): drive lows only; release pin for highs so the TMC can reply.
 void softUartIdle() {
-  pinMode(tmcTxPin, OUTPUT);
-  digitalWrite(tmcTxPin, HIGH);
+  pinMode(tmcTxPin, INPUT);  // high-Z; external 2.2k (or module pull-up) holds idle HIGH
   pinMode(tmcRxPin, INPUT_PULLUP);
 }
 
 void softUartWriteByte(uint8_t b) {
   noInterrupts();
   // start bit
+  pinMode(tmcTxPin, OUTPUT);
   digitalWrite(tmcTxPin, LOW);
   delayMicroseconds(SOFT_BIT_US);
   for (uint8_t i = 0; i < 8; i++) {
-    digitalWrite(tmcTxPin, (b & 0x01) ? HIGH : LOW);
+    if (b & 0x01) {
+      pinMode(tmcTxPin, INPUT);  // release → pull-up = HIGH
+    } else {
+      pinMode(tmcTxPin, OUTPUT);
+      digitalWrite(tmcTxPin, LOW);
+    }
     delayMicroseconds(SOFT_BIT_US);
     b >>= 1;
   }
-  // stop bit
-  digitalWrite(tmcTxPin, HIGH);
+  // stop bit + leave bus released for TMC reply
+  pinMode(tmcTxPin, INPUT);
   delayMicroseconds(SOFT_BIT_US);
   interrupts();
 }
@@ -265,6 +271,7 @@ void softUartWriteBytes(const uint8_t *data, uint8_t len) {
   for (uint8_t i = 0; i < len; i++) {
     softUartWriteByte(data[i]);
   }
+  pinMode(tmcTxPin, INPUT);  // critical for single-wire: do not drive during reply
 }
 
 // Returns true and fills `out` if a byte is received within timeoutMs.
@@ -302,6 +309,7 @@ bool softUartReadBytes(uint8_t *data, uint8_t len, uint32_t firstTimeoutMs, uint
   return true;
 }
 
+// Returns version byte on success, or 0 on failure. Prints short RX debug.
 uint8_t probeVersionSoft(uint8_t addr) {
   softUartIdle();
   delay(2);
@@ -309,16 +317,33 @@ uint8_t probeVersionSoft(uint8_t addr) {
   uint8_t req[4];
   req[0] = 0x05;
   req[1] = (uint8_t)(addr & 0x03);
-  req[2] = 0x06;  // IOIN
+  req[2] = 0x06;  // IOIN (read)
   req[3] = tmcCrc(req, 3);
 
   softUartWriteBytes(req, 4);
 
   uint8_t resp[8];
-  if (!softUartReadBytes(resp, 8, 100, 30)) {
+  uint8_t got = 0;
+  for (; got < 8; got++) {
+    if (!softUartReadByte(resp[got], got == 0 ? 150 : 40)) {
+      break;
+    }
+  }
+
+  if (got == 0) {
+    Serial.print(F("noRX "));
     return 0x00;
   }
-  if (resp[0] != 0x05) {
+  Serial.print(F("rx"));
+  Serial.print(got);
+  Serial.print(F("b "));
+  for (uint8_t i = 0; i < got; i++) {
+    Serial.print(F(" "));
+    Serial.print(resp[i], HEX);
+  }
+  Serial.print(F(" "));
+
+  if (got < 8 || resp[0] != 0x05) {
     return 0x00;
   }
   return resp[6];  // IOIN version field
@@ -458,10 +483,8 @@ void setup() {
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
-  Serial.println(F("UART wiring: GP8->TMC Rx,  GP9<-TMC Tx"));
-  Serial.println(F("IMPORTANT: add 1k-4.7k pull-up from GP9 to 3.3V"));
-  Serial.println(F("  (TMC Tx often idles ~1.2V without it -> reads LOW, UART fails)"));
-  Serial.println(F("t uses software UART (should not freeze)."));
+  Serial.println(F("UART: single-wire — GP8-[1k]-UART_pin, GP9 to same node, 2.2k to 3.3V"));
+  Serial.println(F("t uses open-drain soft UART @9600 (v15)."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
