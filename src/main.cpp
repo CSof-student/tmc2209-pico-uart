@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v19";
+static const char *FW_VERSION = "tmc-uart-v20";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -239,55 +239,54 @@ uint8_t tmcCrc(const uint8_t *data, uint8_t len) {
 }
 
 // Software UART @ 9600 — never touches Serial1, so it cannot hang the HW UART FIFO.
-// Single-wire (PDN/UART): drive lows only; release pin for highs so the TMC can reply.
-// Bit timing uses time_us_32() deadlines (delayMicroseconds drifts and breaks CRC).
+// Datasheet-style: push-pull TX through series 1k while sending; release TX (high-Z)
+// after the datagram so the TMC can drive the shared UART pin.
 static inline void softWaitUntil(uint32_t deadline_us) {
   while ((int32_t)(time_us_32() - deadline_us) < 0) {
   }
 }
 
 void softUartIdle() {
-  pinMode(tmcTxPin, INPUT);  // high-Z; external 2.2k (or module pull-up) holds idle HIGH
+  pinMode(tmcTxPin, INPUT);  // high-Z; external pull-up holds idle HIGH
   pinMode(tmcRxPin, INPUT_PULLUP);
 }
 
-void softUartTxLevel(bool high) {
-  if (high) {
-    pinMode(tmcTxPin, INPUT);  // release → pull-up = HIGH
-  } else {
-    pinMode(tmcTxPin, OUTPUT);
-    digitalWrite(tmcTxPin, LOW);
-  }
-}
-
-void softUartWriteByte(uint8_t b) {
-  noInterrupts();
+// Unlocked write — caller must hold noInterrupts() for the whole datagram.
+void softUartWriteByteUnlocked(uint8_t b) {
   uint32_t deadline = time_us_32();
 
-  // start bit
-  softUartTxLevel(false);
+  pinMode(tmcTxPin, OUTPUT);
+  digitalWrite(tmcTxPin, LOW);  // start bit
   deadline += SOFT_BIT_US;
   softWaitUntil(deadline);
 
   for (uint8_t i = 0; i < 8; i++) {
-    softUartTxLevel(b & 0x01);
+    digitalWrite(tmcTxPin, (b & 0x01) ? HIGH : LOW);
     b >>= 1;
     deadline += SOFT_BIT_US;
     softWaitUntil(deadline);
   }
 
-  // stop bit + leave bus released for TMC reply
-  softUartTxLevel(true);
+  digitalWrite(tmcTxPin, HIGH);  // stop bit
   deadline += SOFT_BIT_US;
   softWaitUntil(deadline);
-  interrupts();
 }
 
 void softUartWriteBytes(const uint8_t *data, uint8_t len) {
+  noInterrupts();
   for (uint8_t i = 0; i < len; i++) {
-    softUartWriteByte(data[i]);
+    softUartWriteByteUnlocked(data[i]);
   }
-  pinMode(tmcTxPin, INPUT);  // critical for single-wire: do not drive during reply
+  // Release bus for TMC reply (do not leave UART TX driving HIGH into the 1k)
+  pinMode(tmcTxPin, INPUT);
+  interrupts();
+}
+
+void softUartWriteByte(uint8_t b) {
+  noInterrupts();
+  softUartWriteByteUnlocked(b);
+  pinMode(tmcTxPin, INPUT);
+  interrupts();
 }
 
 // Returns true and fills `out` if a byte is received within timeoutMs.
@@ -422,8 +421,84 @@ uint8_t probeVersionSoft(uint8_t addr) {
   return resp[6];  // IOIN version field
 }
 
+// Hardware Serial1 probe (datasheet 1k single-wire). Tries one baud rate.
+uint8_t probeVersionHw(uint8_t addr, uint32_t baud) {
+  stopUartPort();
+  SERIAL_PORT.setTX(tmcTxPin);
+  SERIAL_PORT.setRX(tmcRxPin);
+  SERIAL_PORT.begin(baud);
+  uartPortStarted = true;
+  delay(5);
+  while (SERIAL_PORT.available()) {
+    SERIAL_PORT.read();
+  }
+
+  uint8_t req[4];
+  req[0] = 0x05;
+  req[1] = (uint8_t)(addr & 0x03);
+  req[2] = 0x06;
+  req[3] = tmcCrc(req, 3);
+  SERIAL_PORT.write(req, 4);
+  SERIAL_PORT.flush();
+
+  uint8_t resp[8];
+  uint8_t got = 0;
+  const uint32_t t0 = millis();
+  while (got < 8 && (millis() - t0) < 100) {
+    if (SERIAL_PORT.available()) {
+      resp[got++] = (uint8_t)SERIAL_PORT.read();
+    }
+  }
+  stopUartPort();
+
+  Serial.print(F("hw"));
+  Serial.print(baud);
+  Serial.print(F(" rx"));
+  Serial.print(got);
+  Serial.print(F("b"));
+  for (uint8_t i = 0; i < got; i++) {
+    Serial.print(F(" "));
+    Serial.print(resp[i], HEX);
+  }
+  Serial.print(F(" "));
+
+  // Find sync 0x05 in buffer (may include TX echo of request)
+  int syncAt = -1;
+  for (uint8_t i = 0; i + 7 < got; i++) {
+    if (resp[i] == 0x05 && (i + 1 >= got || resp[i + 1] == 0xFF)) {
+      syncAt = (int)i;
+      // prefer 05 FF
+      if (i + 1 < got && resp[i + 1] == 0xFF) {
+        break;
+      }
+    }
+  }
+  if (syncAt < 0) {
+    for (uint8_t i = 0; i + 7 < got; i++) {
+      if (resp[i] == 0x05) {
+        syncAt = (int)i;
+        break;
+      }
+    }
+  }
+  if (syncAt < 0 || syncAt + 7 >= got) {
+    Serial.print(F("noFrame "));
+    return 0x00;
+  }
+
+  uint8_t frame[8];
+  for (uint8_t i = 0; i < 8; i++) {
+    frame[i] = resp[syncAt + i];
+  }
+  if (tmcCrc(frame, 7) != frame[7]) {
+    Serial.print(F("badCRC "));
+    return 0x00;
+  }
+  return frame[6];
+}
+
 void testUart() {
-  Serial.println(F("t: software UART probe @9600 (Serial1 NOT used)"));
+  Serial.println(F("t: soft@9600 then HW Serial1 bauds"));
   Serial.flush();
 
   stopUartPort();  // make sure HW UART is off so pins are free
@@ -458,17 +533,17 @@ void testUart() {
     return;
   }
   if (rxLevel == LOW) {
-    Serial.println(F("t: RX LOW (often OK). Continuing with soft UART."));
+    Serial.println(F("t: RX LOW (often OK). Continuing."));
   }
 
   softUartIdle();
-  Serial.println(F("t: scanning addrs 0..3 ..."));
+  Serial.println(F("t: soft UART scan addrs 0..3 @9600 ..."));
   Serial.flush();
 
   int found = -1;
   uint8_t foundVer = 0;
   for (uint8_t addr = 0; addr < 4; addr++) {
-    Serial.print(F("  addr "));
+    Serial.print(F("  soft addr "));
     Serial.print(addr);
     Serial.print(F(": "));
     Serial.flush();
@@ -477,8 +552,7 @@ void testUart() {
     Serial.print(F("ver=0x"));
     Serial.print(ver, HEX);
 
-    // 0x21 = TMC2209, 0x20 = TMC2208 family; also accept any non-zero if CRC already passed
-    if (ver == 0x21 || ver == 0x20 || ver != 0x00) {
+    if (ver != 0x00) {
       Serial.println(F(" OK"));
       found = addr;
       foundVer = ver;
@@ -486,6 +560,33 @@ void testUart() {
     }
     Serial.println(F(" fail"));
     Serial.flush();
+  }
+
+  if (found < 0) {
+    const uint32_t bauds[] = {115200UL, 57600UL, 38400UL, 19200UL, 9600UL};
+    Serial.println(F("t: HW Serial1 scan ..."));
+    for (uint32_t baud : bauds) {
+      for (uint8_t addr = 0; addr < 4; addr++) {
+        Serial.print(F("  "));
+        Serial.flush();
+        const uint8_t ver = probeVersionHw(addr, baud);
+        Serial.print(F("addr"));
+        Serial.print(addr);
+        Serial.print(F(" ver=0x"));
+        Serial.print(ver, HEX);
+        if (ver != 0x00) {
+          Serial.println(F(" OK"));
+          found = addr;
+          foundVer = ver;
+          break;
+        }
+        Serial.println(F(" fail"));
+        Serial.flush();
+      }
+      if (found >= 0) {
+        break;
+      }
+    }
   }
 
   pinMode(tmcTxPin, INPUT_PULLUP);
@@ -557,8 +658,8 @@ void setup() {
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
-  Serial.println(F("UART: single-wire — GP8-[1k]-UART_pin, GP9 to same node, 2.2k to 3.3V"));
-  Serial.println(F("t uses open-drain soft UART @9600 (v15)."));
+  Serial.println(F("UART: GP8-[1k]-UART_pin, GP9 same node, pull-up 1k-2.2k to 3.3V"));
+  Serial.println(F("t: soft@9600 + HW Serial1 baud sweep (v20)."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
