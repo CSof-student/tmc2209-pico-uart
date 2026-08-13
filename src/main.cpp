@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v18";
+static const char *FW_VERSION = "tmc-uart-v19";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -240,30 +240,46 @@ uint8_t tmcCrc(const uint8_t *data, uint8_t len) {
 
 // Software UART @ 9600 — never touches Serial1, so it cannot hang the HW UART FIFO.
 // Single-wire (PDN/UART): drive lows only; release pin for highs so the TMC can reply.
+// Bit timing uses time_us_32() deadlines (delayMicroseconds drifts and breaks CRC).
+static inline void softWaitUntil(uint32_t deadline_us) {
+  while ((int32_t)(time_us_32() - deadline_us) < 0) {
+  }
+}
+
 void softUartIdle() {
   pinMode(tmcTxPin, INPUT);  // high-Z; external 2.2k (or module pull-up) holds idle HIGH
   pinMode(tmcRxPin, INPUT_PULLUP);
 }
 
+void softUartTxLevel(bool high) {
+  if (high) {
+    pinMode(tmcTxPin, INPUT);  // release → pull-up = HIGH
+  } else {
+    pinMode(tmcTxPin, OUTPUT);
+    digitalWrite(tmcTxPin, LOW);
+  }
+}
+
 void softUartWriteByte(uint8_t b) {
   noInterrupts();
+  uint32_t deadline = time_us_32();
+
   // start bit
-  pinMode(tmcTxPin, OUTPUT);
-  digitalWrite(tmcTxPin, LOW);
-  delayMicroseconds(SOFT_BIT_US);
+  softUartTxLevel(false);
+  deadline += SOFT_BIT_US;
+  softWaitUntil(deadline);
+
   for (uint8_t i = 0; i < 8; i++) {
-    if (b & 0x01) {
-      pinMode(tmcTxPin, INPUT);  // release → pull-up = HIGH
-    } else {
-      pinMode(tmcTxPin, OUTPUT);
-      digitalWrite(tmcTxPin, LOW);
-    }
-    delayMicroseconds(SOFT_BIT_US);
+    softUartTxLevel(b & 0x01);
     b >>= 1;
+    deadline += SOFT_BIT_US;
+    softWaitUntil(deadline);
   }
+
   // stop bit + leave bus released for TMC reply
-  pinMode(tmcTxPin, INPUT);
-  delayMicroseconds(SOFT_BIT_US);
+  softUartTxLevel(true);
+  deadline += SOFT_BIT_US;
+  softWaitUntil(deadline);
   interrupts();
 }
 
@@ -298,17 +314,17 @@ bool softUartReadByte(uint8_t &out, uint32_t timeoutMs, bool requireIdleHigh) {
   }
 
   noInterrupts();
-  // sample mid first data bit: half start + half data
-  delayMicroseconds(SOFT_BIT_US + SOFT_BIT_US / 2);
+  const uint32_t t0 = time_us_32();  // ~start-bit falling edge
   uint8_t b = 0;
   for (uint8_t i = 0; i < 8; i++) {
+    // sample mid data bit i: 1.5 bit after start edge, then +1 bit each
+    softWaitUntil(t0 + SOFT_BIT_US + (SOFT_BIT_US / 2) + (uint32_t)i * SOFT_BIT_US);
     if (digitalRead(tmcRxPin)) {
       b |= (uint8_t)(1u << i);
     }
-    delayMicroseconds(SOFT_BIT_US);
   }
   // wait out stop bit
-  delayMicroseconds(SOFT_BIT_US);
+  softWaitUntil(t0 + SOFT_BIT_US * 10);
   interrupts();
   out = b;
   return true;
