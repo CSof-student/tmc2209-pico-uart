@@ -31,7 +31,7 @@ static const uint16_t DEFAULT_RMS_MA = 300;
 static const uint16_t DEFAULT_MICROSTEPS = 16;
 static const uint32_t DEFAULT_SPEED_HZ = 200;
 static const uint32_t DEFAULT_ACCEL = 400;
-static const int32_t DEFAULT_STEP_SIZE = 8;
+static const int32_t DEFAULT_STEP_SIZE = 200;
 
 #define SERIAL_PORT Serial1
 
