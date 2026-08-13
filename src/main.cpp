@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v15";
+static const char *FW_VERSION = "tmc-uart-v16";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -322,30 +322,72 @@ uint8_t probeVersionSoft(uint8_t addr) {
 
   softUartWriteBytes(req, 4);
 
+  // Let the bus return to idle HIGH after our TX (and ignore TX echo glitches).
+  {
+    const uint32_t idleStart = millis();
+    while (millis() - idleStart < 5) {
+      if (digitalRead(tmcRxPin) == LOW) {
+        // consume until high again or timeout
+        const uint32_t t0 = millis();
+        while (digitalRead(tmcRxPin) == LOW && millis() - t0 < 5) {
+        }
+      } else {
+        delayMicroseconds(50);
+        if (digitalRead(tmcRxPin) == HIGH) {
+          break;
+        }
+      }
+    }
+  }
+
+  // Hunt for reply sync 0x05, then read the remaining 7 bytes.
   uint8_t resp[8];
-  uint8_t got = 0;
-  for (; got < 8; got++) {
-    if (!softUartReadByte(resp[got], got == 0 ? 150 : 40)) {
+  uint8_t sync = 0;
+  bool gotSync = false;
+  const uint32_t huntStart = millis();
+  while (millis() - huntStart < 200) {
+    if (!softUartReadByte(sync, 50)) {
+      continue;
+    }
+    if (sync == 0x05) {
+      gotSync = true;
       break;
     }
   }
 
-  if (got == 0) {
-    Serial.print(F("noRX "));
+  if (!gotSync) {
+    Serial.print(F("noSync "));
     return 0x00;
   }
+
+  resp[0] = 0x05;
+  uint8_t got = 1;
+  for (; got < 8; got++) {
+    if (!softUartReadByte(resp[got], 40)) {
+      break;
+    }
+  }
+
   Serial.print(F("rx"));
   Serial.print(got);
-  Serial.print(F("b "));
+  Serial.print(F("b"));
   for (uint8_t i = 0; i < got; i++) {
     Serial.print(F(" "));
     Serial.print(resp[i], HEX);
   }
   Serial.print(F(" "));
 
-  if (got < 8 || resp[0] != 0x05) {
+  if (got < 8) {
+    Serial.print(F("short "));
     return 0x00;
   }
+
+  const uint8_t crc = tmcCrc(resp, 7);
+  if (crc != resp[7]) {
+    Serial.print(F("badCRC "));
+    return 0x00;
+  }
+
   return resp[6];  // IOIN version field
 }
 
@@ -401,10 +443,11 @@ void testUart() {
     Serial.flush();
 
     const uint8_t ver = probeVersionSoft(addr);
-    Serial.print(F("0x"));
+    Serial.print(F("ver=0x"));
     Serial.print(ver, HEX);
 
-    if (ver == 0x21 || ver == 0x20) {
+    // 0x21 = TMC2209, 0x20 = TMC2208 family; also accept any non-zero if CRC already passed
+    if (ver == 0x21 || ver == 0x20 || ver != 0x00) {
       Serial.println(F(" OK"));
       found = addr;
       foundVer = ver;
