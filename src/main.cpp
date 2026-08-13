@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v16";
+static const char *FW_VERSION = "tmc-uart-v17";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -275,14 +275,24 @@ void softUartWriteBytes(const uint8_t *data, uint8_t len) {
 }
 
 // Returns true and fills `out` if a byte is received within timeoutMs.
+// Requires a real idle-HIGH then falling edge (line already LOW ≠ a start bit).
 bool softUartReadByte(uint8_t &out, uint32_t timeoutMs) {
   const uint32_t start = millis();
-  // wait for start bit (HIGH -> LOW) — interrupts OK while waiting
+
+  // 1) Must see idle HIGH first
+  while (digitalRead(tmcRxPin) == LOW) {
+    if (millis() - start > timeoutMs) {
+      return false;
+    }
+  }
+
+  // 2) Wait for falling edge (start bit)
   while (digitalRead(tmcRxPin) == HIGH) {
     if (millis() - start > timeoutMs) {
       return false;
     }
   }
+
   noInterrupts();
   // sample mid first data bit: half start + half data
   delayMicroseconds(SOFT_BIT_US + SOFT_BIT_US / 2);
@@ -314,6 +324,12 @@ uint8_t probeVersionSoft(uint8_t addr) {
   softUartIdle();
   delay(2);
 
+  // Bus must idle HIGH on single-wire UART
+  if (digitalRead(tmcRxPin) == LOW) {
+    Serial.print(F("busLOW "));
+    return 0x00;
+  }
+
   uint8_t req[4];
   req[0] = 0x05;
   req[1] = (uint8_t)(addr & 0x03);
@@ -322,22 +338,16 @@ uint8_t probeVersionSoft(uint8_t addr) {
 
   softUartWriteBytes(req, 4);
 
-  // Let the bus return to idle HIGH after our TX (and ignore TX echo glitches).
+  // Recover to idle HIGH before hunting for reply sync
   {
-    const uint32_t idleStart = millis();
-    while (millis() - idleStart < 5) {
-      if (digitalRead(tmcRxPin) == LOW) {
-        // consume until high again or timeout
-        const uint32_t t0 = millis();
-        while (digitalRead(tmcRxPin) == LOW && millis() - t0 < 5) {
-        }
-      } else {
-        delayMicroseconds(50);
-        if (digitalRead(tmcRxPin) == HIGH) {
-          break;
-        }
+    const uint32_t t0 = millis();
+    while (digitalRead(tmcRxPin) == LOW) {
+      if (millis() - t0 > 20) {
+        Serial.print(F("stuckLOW "));
+        return 0x00;
       }
     }
+    delayMicroseconds(200);
   }
 
   // Hunt for reply sync 0x05, then read the remaining 7 bytes.
