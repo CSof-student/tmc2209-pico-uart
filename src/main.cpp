@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v23";
+static const char *FW_VERSION = "tmc-uart-v24";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -115,22 +115,9 @@ bool checkUartPinsSafeToStart() {
 }
 
 bool ensureUartPortSafe() {
-  if (uartPortStarted) {
-    return true;
-  }
-  if (!checkUartPinsSafeToStart()) {
-    return false;
-  }
-
-  SERIAL_PORT.setTX(tmcTxPin);
-  SERIAL_PORT.setRX(tmcRxPin);
-  SERIAL_PORT.begin(115200);
-  delay(30);
-  while (SERIAL_PORT.available()) {
-    SERIAL_PORT.read();
-  }
-  uartPortStarted = true;
-  return true;
+  // Serial1 hangs on this single-wire setup — never start it from commands.
+  // Config uses soft UART @9600 instead (same path as `t`).
+  return checkUartPinsSafeToStart();
 }
 
 void printHelp() {
@@ -142,7 +129,7 @@ void printHelp() {
   Serial.println(F("  t   TMC probe via software UART @9600 (no Serial1)"));
   Serial.println(F("  w   swap TX/RX — ONLY if TX pin was LOW"));
   Serial.println(F("      If RX was LOW, do not swap"));
-  Serial.println(F("  u   apply TMC defaults (uses Serial1 — may hang if bus bad)"));
+  Serial.println(F("  u   apply TMC defaults via soft UART @9600 (no Serial1)"));
   Serial.println(F("  c/m/i/+/- /p/x   current/microsteps/status/move/..."));
 }
 
@@ -431,7 +418,89 @@ uint8_t probeVersionSoft(uint8_t addr) {
   return resp[6];
 }
 
-void testUart() {
+// Write a TMC register over soft UART (no reply). addr is 7-bit register (write bit added).
+void softRegWrite(uint8_t reg, uint32_t value) {
+  softUartIdle();
+  delay(1);
+  uint8_t d[8];
+  d[0] = 0x05;
+  d[1] = (uint8_t)(driverAddress & 0x03);
+  d[2] = (uint8_t)(reg | 0x80);
+  d[3] = (uint8_t)(value >> 24);
+  d[4] = (uint8_t)(value >> 16);
+  d[5] = (uint8_t)(value >> 8);
+  d[6] = (uint8_t)(value >> 0);
+  d[7] = tmcCrc(d, 7);
+  softUartWriteBytes(d, 8);
+  pinMode(tmcTxPin, INPUT);
+  delay(2);  // allow TMC to process before next datagram
+}
+
+uint32_t softCurrentScale(uint16_t mA, bool &vsenseHigh) {
+  // Same formula as TMCStepper::rms_current
+  float cs = 32.0f * 1.41421f * (mA / 1000.0f) * (R_SENSE + 0.02f) / 0.325f - 1.0f;
+  vsenseHigh = false;
+  if (cs < 16.0f) {
+    vsenseHigh = true;
+    cs = 32.0f * 1.41421f * (mA / 1000.0f) * (R_SENSE + 0.02f) / 0.180f - 1.0f;
+  }
+  if (cs > 31.0f) {
+    cs = 31.0f;
+  }
+  if (cs < 0.0f) {
+    cs = 0.0f;
+  }
+  return (uint32_t)(cs + 0.5f);
+}
+
+void applyDriverDefaults() {
+  stopUartPort();
+  if (!checkUartPinsSafeToStart()) {
+    return;
+  }
+
+  Serial.println(F("Applying TMC defaults via soft UART @9600..."));
+
+  // GCONF: pdn_disable | mstep_reg_select | multistep_filt; I_scale_analog=0; stealthChop
+  const uint32_t gconf = (1UL << 6) | (1UL << 7) | (1UL << 8);
+  softRegWrite(0x00, gconf);
+  Serial.println(F("  GCONF"));
+
+  bool vsenseHigh = false;
+  uint32_t cs = softCurrentScale(rmsMa, vsenseHigh);
+  uint32_t ihold = (cs * 3) / 10;
+  if (ihold < 1) {
+    ihold = 1;
+  }
+  // IHOLD_IRUN: IHOLD | IRUN<<8 | IHOLDDELAY<<16
+  const uint32_t iholdIrun = ihold | (cs << 8) | (2UL << 16);
+  softRegWrite(0x10, iholdIrun);
+  Serial.print(F("  IHOLD_IRUN cs="));
+  Serial.println(cs);
+
+  softRegWrite(0x11, 20);  // TPOWERDOWN
+  Serial.println(F("  TPOWERDOWN"));
+
+  // CHOPCONF: start from library default, toff=5, mres for 16µsteps (=4), vsense as needed
+  // default 0x10000053 → toff=5 → …55; mres=4 → 0x04xxxxxx; vsense bit 17
+  uint32_t chop = 0x10000055UL;
+  chop = (chop & ~(0xFUL << 24)) | (4UL << 24);  // 16 microsteps
+  if (vsenseHigh) {
+    chop |= (1UL << 17);
+  } else {
+    chop &= ~(1UL << 17);
+  }
+  softRegWrite(0x6C, chop);
+  Serial.println(F("  CHOPCONF"));
+
+  // PWMCONF default with pwm_autoscale
+  softRegWrite(0x70, 0xC10D0024UL);
+  Serial.println(F("  PWMCONF"));
+
+  driverConfigured = true;
+  softUartIdle();
+  Serial.println(F("Done (soft UART)"));
+}
   Serial.println(F("t: soft UART only @9600 (no HW Serial1 — avoids hang)"));
 
   stopUartPort();
@@ -509,33 +578,6 @@ void swapUartPins() {
   Serial.println(F("Reminder: only swap if the LOW pin was the TX pin."));
 }
 
-void applyDriverDefaults() {
-  if (!ensureUartPortSafe()) {
-    return;
-  }
-  if (!driver) {
-    recreateDriver(driverAddress);
-  }
-  Serial.println(F("Applying TMC defaults..."));
-  Serial.flush();
-  driver->begin();
-  driver->pdn_disable(true);
-  driver->I_scale_analog(false);
-  driver->toff(5);
-  driver->rms_current(rmsMa);
-  driver->microsteps(DEFAULT_MICROSTEPS);
-  driver->pwm_autoscale(true);
-  driver->en_spreadCycle(false);
-  uint8_t hold = (uint8_t)(driver->irun() * 3 / 10);
-  if (hold < 1) {
-    hold = 1;
-  }
-  driver->ihold(hold);
-  driver->iholddelay(2);
-  driverConfigured = true;
-  Serial.println(F("Done"));
-}
-
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {
@@ -547,7 +589,7 @@ void setup() {
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
   Serial.println(F("UART: GP8-[1k]-UART_pin, GP9 same node, pull-up 1k-2.2k to 3.3V"));
-  Serial.println(F("t: soft@9600 only (v23)."));
+  Serial.println(F("t/u/c/m: soft UART @9600 (v24). No Serial1."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
@@ -626,30 +668,62 @@ void processCommand(String cmd) {
     }
   } else if (c == 'c' || c == 'C') {
     const int v = cmd.substring(1).toInt();
-    if (v > 0 && v < 2000 && ensureUartPortSafe()) {
-      rmsMa = (uint16_t)v;
-      if (!driver) {
-        recreateDriver(driverAddress);
+    if (v > 0 && v < 2000) {
+      if (!checkUartPinsSafeToStart()) {
+        return;
       }
-      driver->rms_current(rmsMa);
+      rmsMa = (uint16_t)v;
+      bool vsenseHigh = false;
+      uint32_t cs = softCurrentScale(rmsMa, vsenseHigh);
+      uint32_t ihold = (cs * 3) / 10;
+      if (ihold < 1) {
+        ihold = 1;
+      }
+      softRegWrite(0x10, ihold | (cs << 8) | (2UL << 16));
+      // Update vsense in CHOPCONF bit 17 without full rewrite of mres/toff
+      uint32_t chop = 0x10000055UL;
+      chop = (chop & ~(0xFUL << 24)) | (4UL << 24);
+      if (vsenseHigh) {
+        chop |= (1UL << 17);
+      }
+      softRegWrite(0x6C, chop);
+      softUartIdle();
       Serial.print(F("rms_mA="));
-      Serial.println(rmsMa);
+      Serial.print(rmsMa);
+      Serial.print(F(" cs="));
+      Serial.println(cs);
     }
   } else if (c == 'm' || c == 'M') {
     const int v = cmd.substring(1).toInt();
-    if ((v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) &&
-        ensureUartPortSafe()) {
-      if (!driver) {
-        recreateDriver(driverAddress);
+    uint8_t mres = 0xFF;
+    if (v == 256) mres = 0;
+    else if (v == 128) mres = 1;
+    else if (v == 64) mres = 2;
+    else if (v == 32) mres = 3;
+    else if (v == 16) mres = 4;
+    else if (v == 8) mres = 5;
+    if (mres != 0xFF) {
+      if (!checkUartPinsSafeToStart()) {
+        return;
       }
-      driver->microsteps(v);
+      bool vsenseHigh = false;
+      softCurrentScale(rmsMa, vsenseHigh);
+      uint32_t chop = 0x10000055UL;
+      chop = (chop & ~(0xFUL << 24)) | ((uint32_t)mres << 24);
+      if (vsenseHigh) {
+        chop |= (1UL << 17);
+      }
+      softRegWrite(0x6C, chop);
+      softUartIdle();
       Serial.println(v);
     }
   } else if (c == 'i' || c == 'I') {
-    if (ensureUartPortSafe() && driver) {
-      Serial.print(F("ver=0x"));
-      Serial.println(driver->version(), HEX);
-    }
+    Serial.print(F("configured="));
+    Serial.print(driverConfigured ? F("yes") : F("no"));
+    Serial.print(F(" addr="));
+    Serial.print(driverAddress);
+    Serial.print(F(" rms_mA="));
+    Serial.println(rmsMa);
   } else if (c == 'x' || c == 'X') {
     if (stepper) {
       stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
