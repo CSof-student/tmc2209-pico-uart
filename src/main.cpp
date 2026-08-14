@@ -501,6 +501,8 @@ void applyDriverDefaults() {
   softUartIdle();
   Serial.println(F("Done (soft UART)"));
 }
+
+void testUart() {
   Serial.println(F("t: soft UART only @9600 (no HW Serial1 — avoids hang)"));
 
   stopUartPort();
