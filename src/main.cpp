@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v24";
+static const char *FW_VERSION = "tmc-uart-v26";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -52,6 +52,21 @@ int32_t stepSize = DEFAULT_STEP_SIZE;
 uint16_t rmsMa = DEFAULT_RMS_MA;
 bool driverConfigured = false;
 String line;
+
+// StallGuard / linear travel limits
+// Physical: + retracts, - extends. Position: 0 = retracted, travelMax = extended.
+uint8_t sgThreshold = 50;          // SGTHRS: higher = more sensitive (easier stall trip)
+bool travelCalibrated = false;
+int32_t travelMin = 0;             // retracted end
+int32_t travelMax = 0;             // extended end
+static const int32_t HOME_BACKOFF = 32;
+static const int32_t HOME_CHUNK = 40;
+static const int32_t HOME_MAX_TRAVEL = 20000;
+static const uint32_t HOME_SPEED_HZ = 150;
+static const uint32_t HOME_ACCEL = 300;
+
+uint32_t moveSpeedHz = DEFAULT_SPEED_HZ;
+int32_t moveAccel = DEFAULT_ACCEL;
 
 void recreateDriver(uint8_t addr) {
   driverAddress = addr & 0x03;
@@ -121,16 +136,12 @@ bool ensureUartPortSafe() {
 }
 
 void printHelp() {
-  Serial.println(F("\nCommands (safe ones first):"));
-  Serial.println(F("  v   print firmware version (always safe)"));
-  Serial.println(F("  h   help"));
-  Serial.println(F("  k   pin short check (do this first)"));
-  Serial.println(F("  l   UART loopback hint / test helpers"));
-  Serial.println(F("  t   TMC probe via software UART @9600 (no Serial1)"));
-  Serial.println(F("  w   swap TX/RX — ONLY if TX pin was LOW"));
-  Serial.println(F("      If RX was LOW, do not swap"));
-  Serial.println(F("  u   apply TMC defaults via soft UART @9600 (no Serial1)"));
-  Serial.println(F("  c/m/i/+/- /p/x   current/microsteps/status/move/..."));
+  Serial.println(F("\nCommands:"));
+  Serial.println(F("  h/? help   v version   k pin check   t UART probe"));
+  Serial.println(F("  u apply defaults (soft UART)"));
+  Serial.println(F("  c <mA>  m <usteps>  i status"));
+  Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
+  Serial.println(F("  z SG read   y <0-255> SG thresh   H home ends (+retract=0, -extend=max)"));
 }
 
 void printMotionStatus() {
@@ -436,6 +447,190 @@ void softRegWrite(uint8_t reg, uint32_t value) {
   delay(2);  // allow TMC to process before next datagram
 }
 
+// Read a TMC register over soft UART. Returns true and sets value on success.
+bool softRegRead(uint8_t reg, uint32_t &value) {
+  softUartIdle();
+  delay(1);
+
+  if (digitalRead(tmcRxPin) == LOW) {
+    return false;
+  }
+
+  uint8_t req[4];
+  req[0] = 0x05;
+  req[1] = (uint8_t)(driverAddress & 0x03);
+  req[2] = (uint8_t)(reg & 0x7F);
+  req[3] = tmcCrc(req, 3);
+  softUartWriteBytes(req, 4);
+
+  {
+    const uint32_t t0 = millis();
+    while (digitalRead(tmcRxPin) == LOW) {
+      if (millis() - t0 > 20) {
+        return false;
+      }
+    }
+    delayMicroseconds(100);
+  }
+
+  uint8_t resp[8];
+  bool got = false;
+  const uint32_t huntStart = millis();
+  while (millis() - huntStart < 200) {
+    uint8_t b0 = 0;
+    if (!softUartReadByte(b0, 40, true) || b0 != 0x05) {
+      continue;
+    }
+    noInterrupts();
+    resp[0] = 0x05;
+    uint8_t n = 1;
+    for (; n < 8; n++) {
+      if (!softUartReadByteUnlocked(resp[n], true)) {
+        break;
+      }
+    }
+    interrupts();
+    if (n < 8 || resp[1] != 0xFF) {
+      continue;
+    }
+    if (tmcCrc(resp, 7) != resp[7]) {
+      continue;
+    }
+    got = true;
+    break;
+  }
+  if (!got) {
+    return false;
+  }
+  value = ((uint32_t)resp[3] << 24) | ((uint32_t)resp[4] << 16) |
+          ((uint32_t)resp[5] << 8) | (uint32_t)resp[6];
+  return true;
+}
+
+uint16_t readStallGuard() {
+  uint32_t v = 0;
+  if (!softRegRead(0x41, v)) {  // SG_RESULT
+    return 0xFFFF;
+  }
+  return (uint16_t)(v & 0x3FF);
+}
+
+void setupStallGuard(uint8_t threshold) {
+  sgThreshold = threshold;
+  // TCOOLTHRS high → StallGuard active at our homing/move speeds
+  softRegWrite(0x14, 0xFFFFFUL);
+  softRegWrite(0x40, sgThreshold);  // SGTHRS
+  softUartIdle();
+}
+
+void waitStepperIdle() {
+  if (!stepper) {
+    return;
+  }
+  while (stepper->isRunning()) {
+    delay(1);
+  }
+}
+
+// Move in small chunks, polling SG_RESULT between chunks. dirSign: +1 or -1.
+// Returns true if stall seen. On stall, backs off HOME_BACKOFF steps.
+bool moveUntilStall(int dirSign, int32_t maxSteps) {
+  if (!stepper || maxSteps <= 0) {
+    return false;
+  }
+
+  const uint32_t oldSpeed = moveSpeedHz;
+  const int32_t oldAccel = moveAccel;
+  stepper->setSpeedInHz(HOME_SPEED_HZ);
+  stepper->setAcceleration(HOME_ACCEL);
+
+  int32_t moved = 0;
+  bool stalled = false;
+  while (moved < maxSteps) {
+    const int32_t chunk = (maxSteps - moved > HOME_CHUNK) ? HOME_CHUNK : (maxSteps - moved);
+    stepper->move((int32_t)dirSign * chunk);
+    waitStepperIdle();
+    delay(8);
+
+    const uint16_t sg = readStallGuard();
+    Serial.print(F("  sg="));
+    Serial.print(sg);
+    Serial.print(F(" pos="));
+    Serial.println(stepper->getCurrentPosition());
+
+    if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
+      stalled = true;
+      break;
+    }
+    moved += chunk;
+  }
+
+  if (stalled) {
+    stepper->move((int32_t)(-dirSign) * HOME_BACKOFF);
+    waitStepperIdle();
+  }
+
+  if (oldSpeed > 0) {
+    stepper->setSpeedInHz(oldSpeed);
+  }
+  if (oldAccel > 0) {
+    stepper->setAcceleration(oldAccel);
+  }
+  return stalled;
+}
+
+// Calibrate linear travel: -dir = min (0), +dir = max.
+void homeBothEnds() {
+  if (!stepper) {
+    Serial.println(F("no stepper"));
+    return;
+  }
+  if (!driverConfigured) {
+    Serial.println(F("run u first"));
+    return;
+  }
+  if (!checkUartPinsSafeToStart()) {
+    return;
+  }
+
+  Serial.println(F("StallGuard home (+retract / -extend)..."));
+  setupStallGuard(sgThreshold);
+  Serial.print(F("SGTHRS="));
+  Serial.println(sgThreshold);
+
+  Serial.println(F("Seeking RETRACTED (+) ..."));
+  if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
+    Serial.println(F("RETRACT: no stall — raise y threshold or check mechanics"));
+    travelCalibrated = false;
+    return;
+  }
+  stepper->setCurrentPosition(0);
+  travelMin = 0;
+  Serial.println(F("Retracted end = 0"));
+
+  delay(100);
+
+  Serial.println(F("Seeking EXTENDED (-) ..."));
+  if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
+    Serial.println(F("EXTEND: no stall — raise y threshold or check mechanics"));
+    travelCalibrated = false;
+    return;
+  }
+  // Moved in - direction from 0, so position is negative; flip to 0..max
+  travelMax = -stepper->getCurrentPosition();
+  if (travelMax < HOME_BACKOFF * 2) {
+    Serial.println(F("Travel too short — tune y / speed / current"));
+    travelCalibrated = false;
+    return;
+  }
+  stepper->setCurrentPosition(travelMax);
+  travelCalibrated = true;
+  Serial.print(F("Travel 0 (retract) .. "));
+  Serial.print(travelMax);
+  Serial.println(F(" (extend)"));
+  Serial.println(F("Home done. +retracts -extends; g 0 / g <max>"));
+}
+
 uint32_t softCurrentScale(uint16_t mA, bool &vsenseHigh) {
   // Same formula as TMCStepper::rms_current
   float cs = 32.0f * 1.41421f * (mA / 1000.0f) * (R_SENSE + 0.02f) / 0.325f - 1.0f;
@@ -496,6 +691,10 @@ void applyDriverDefaults() {
   // PWMCONF default with pwm_autoscale
   softRegWrite(0x70, 0xC10D0024UL);
   Serial.println(F("  PWMCONF"));
+
+  setupStallGuard(sgThreshold);
+  Serial.print(F("  StallGuard SGTHRS="));
+  Serial.println(sgThreshold);
 
   driverConfigured = true;
   softUartIdle();
@@ -591,7 +790,7 @@ void setup() {
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
   Serial.println(F("UART: GP8-[1k]-UART_pin, GP9 same node, pull-up 1k-2.2k to 3.3V"));
-  Serial.println(F("t/u/c/m: soft UART @9600 (v24). No Serial1."));
+  Serial.println(F("t/u/c/m/H: soft UART @9600 (v25). StallGuard: z y H"));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
@@ -621,8 +820,10 @@ void processCommand(String cmd) {
   }
   const char c = cmd.charAt(0);
 
-  if (c == 'h' || c == 'H' || c == '?') {
+  if (c == 'h' || c == '?') {
     printHelp();
+  } else if (c == 'H') {
+    homeBothEnds();
   } else if (c == 'v' || c == 'V') {
     Serial.print(F("firmware="));
     Serial.println(FW_VERSION);
@@ -640,16 +841,62 @@ void processCommand(String cmd) {
     applyDriverDefaults();
   } else if (c == 'p' || c == 'P') {
     printMotionStatus();
-  } else if (c == '+' || c == '-') {
-    int32_t delta = (c == '+') ? stepSize : -stepSize;
-    if (cmd.length() > 1) {
-      delta = cmd.substring(1).toInt();
-      if (c == '-' && delta > 0) {
-        delta = -delta;
+    if (travelCalibrated) {
+      Serial.print(F("  travel=0.."));
+      Serial.println(travelMax);
+    }
+  } else if (c == 'z' || c == 'Z') {
+    if (!checkUartPinsSafeToStart()) {
+      return;
+    }
+    const uint16_t sg = readStallGuard();
+    Serial.print(F("SG_RESULT="));
+    Serial.print(sg);
+    Serial.print(F("  SGTHRS="));
+    Serial.println(sgThreshold);
+  } else if (c == 'y' || c == 'Y') {
+    const int v = cmd.substring(1).toInt();
+    if (v >= 0 && v <= 255) {
+      if (!checkUartPinsSafeToStart()) {
+        return;
       }
+      setupStallGuard((uint8_t)v);
+      Serial.print(F("SGTHRS="));
+      Serial.println(sgThreshold);
+    }
+  } else if (c == 'g' || c == 'G') {
+    const int32_t target = cmd.substring(1).toInt();
+    if (!stepper) {
+      return;
+    }
+    int32_t dest = target;
+    if (travelCalibrated) {
+      if (dest < travelMin) dest = travelMin;
+      if (dest > travelMax) dest = travelMax;
+    }
+    stepper->moveTo(dest);
+    Serial.print(F("goto "));
+    Serial.println(dest);
+  } else if (c == '+' || c == '-') {
+    // Physical: + retracts (toward 0), - extends (toward travelMax)
+    int32_t delta = (c == '+') ? -stepSize : stepSize;
+    if (cmd.length() > 1) {
+      int32_t mag = cmd.substring(1).toInt();
+      if (mag < 0) {
+        mag = -mag;
+      }
+      delta = (c == '+') ? -mag : mag;
     }
     if (stepper) {
-      stepper->move(delta);
+      int32_t dest = stepper->getCurrentPosition() + delta;
+      if (travelCalibrated) {
+        if (dest < travelMin) dest = travelMin;
+        if (dest > travelMax) dest = travelMax;
+        delta = dest - stepper->getCurrentPosition();
+      }
+      if (delta != 0) {
+        stepper->move(delta);
+      }
     }
     Serial.print(F("move "));
     Serial.println(delta);
@@ -661,11 +908,13 @@ void processCommand(String cmd) {
   } else if (c == 's' || c == 'S') {
     const uint32_t v = (uint32_t)cmd.substring(1).toInt();
     if (v > 0 && stepper) {
+      moveSpeedHz = v;
       stepper->setSpeedInHz(v);
     }
   } else if (c == 'a' || c == 'A') {
     const int32_t v = cmd.substring(1).toInt();
     if (v > 0 && stepper) {
+      moveAccel = v;
       stepper->setAcceleration(v);
     }
   } else if (c == 'c' || c == 'C') {
