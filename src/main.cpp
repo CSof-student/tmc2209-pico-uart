@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v26";
+static const char *FW_VERSION = "tmc-uart-v27";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -59,9 +59,12 @@ uint8_t sgThreshold = 50;          // SGTHRS: higher = more sensitive (easier st
 bool travelCalibrated = false;
 int32_t travelMin = 0;             // retracted end
 int32_t travelMax = 0;             // extended end
-static const int32_t HOME_BACKOFF = 32;
+static const int32_t HOME_BACKOFF = 48;
 static const int32_t HOME_CHUNK = 40;
 static const int32_t HOME_MAX_TRAVEL = 20000;
+static const int32_t HOME_MIN_TRAVEL = 200;   // reject false end-to-end
+static const uint8_t HOME_IGNORE_CHUNKS = 4;  // skip SG at start of each seek
+static const uint8_t HOME_STALL_HITS = 2;     // need N low readings in a row
 static const uint32_t HOME_SPEED_HZ = 150;
 static const uint32_t HOME_ACCEL = 300;
 
@@ -545,29 +548,52 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   stepper->setAcceleration(HOME_ACCEL);
 
   int32_t moved = 0;
+  uint8_t chunkIdx = 0;
+  uint8_t lowHits = 0;
   bool stalled = false;
+
+  // Let mechanical load settle after a prior end hit / direction change
+  delay(150);
+
   while (moved < maxSteps) {
     const int32_t chunk = (maxSteps - moved > HOME_CHUNK) ? HOME_CHUNK : (maxSteps - moved);
     stepper->move((int32_t)dirSign * chunk);
     waitStepperIdle();
-    delay(8);
+    delay(15);
 
     const uint16_t sg = readStallGuard();
     Serial.print(F("  sg="));
     Serial.print(sg);
     Serial.print(F(" pos="));
-    Serial.println(stepper->getCurrentPosition());
+    Serial.print(stepper->getCurrentPosition());
 
-    if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
-      stalled = true;
-      break;
+    const bool inIgnore = (chunkIdx < HOME_IGNORE_CHUNKS);
+    if (inIgnore) {
+      Serial.println(F(" (ignore)"));
+      lowHits = 0;
+    } else if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
+      lowHits++;
+      Serial.print(F(" low "));
+      Serial.print(lowHits);
+      Serial.print(F("/"));
+      Serial.println(HOME_STALL_HITS);
+      if (lowHits >= HOME_STALL_HITS) {
+        stalled = true;
+        break;
+      }
+    } else {
+      lowHits = 0;
+      Serial.println();
     }
+
     moved += chunk;
+    chunkIdx++;
   }
 
   if (stalled) {
     stepper->move((int32_t)(-dirSign) * HOME_BACKOFF);
     waitStepperIdle();
+    delay(100);
   }
 
   if (oldSpeed > 0) {
@@ -617,9 +643,17 @@ void homeBothEnds() {
     return;
   }
   // Moved in - direction from 0, so position is negative; flip to 0..max
-  travelMax = -stepper->getCurrentPosition();
-  if (travelMax < HOME_BACKOFF * 2) {
-    Serial.println(F("Travel too short — tune y / speed / current"));
+  const int32_t raw = stepper->getCurrentPosition();
+  travelMax = -raw;
+  Serial.print(F("  rawPos="));
+  Serial.print(raw);
+  Serial.print(F(" → travelMax="));
+  Serial.println(travelMax);
+
+  if (travelMax < HOME_MIN_TRAVEL) {
+    Serial.println(F("Travel too short — usually a false stall after retract."));
+    Serial.println(F("  Try: lower y (e.g. y 30), then H again"));
+    Serial.println(F("  Watch sg= lines: free move should stay ABOVE SGTHRS"));
     travelCalibrated = false;
     return;
   }
