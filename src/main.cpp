@@ -16,7 +16,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 
-static const char *FW_VERSION = "tmc-uart-v22";
+static const char *FW_VERSION = "tmc-uart-v23";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -287,14 +287,13 @@ void softUartWriteByte(uint8_t b) {
 bool softUartReadByteUnlocked(uint8_t &out, bool waitFalling) {
   if (waitFalling) {
     const uint32_t giveUp = time_us_32() + SOFT_BIT_US * 30;
-    while (digitalRead(tmcRxPin) == LOW) {
-      if ((int32_t)(time_us_32() - giveUp) >= 0) {
-        return false;
-      }
-    }
-    while (digitalRead(tmcRxPin) == HIGH) {
-      if ((int32_t)(time_us_32() - giveUp) >= 0) {
-        return false;
+    // If line is already LOW, that IS the next start bit — do not wait for HIGH first
+    // (waiting HIGH would skip the byte and cause noSync).
+    if (digitalRead(tmcRxPin) == HIGH) {
+      while (digitalRead(tmcRxPin) == HIGH) {
+        if ((int32_t)(time_us_32() - giveUp) >= 0) {
+          return false;
+        }
       }
     }
   }
@@ -374,25 +373,20 @@ uint8_t probeVersionSoft(uint8_t addr) {
     delayMicroseconds(100);
   }
 
-  // Hunt 05, then atomically read the rest (keeps IRQ off across the datagram).
+  // After sync 0x05, grab the rest with IRQs off. Prefer header 05 FF (reply),
+  // but if we only see echo (05 <addr>), keep hunting.
   uint8_t resp[8];
   bool got = false;
   const uint32_t huntStart = millis();
-  while (millis() - huntStart < 150) {
+  while (millis() - huntStart < 200) {
     uint8_t b0 = 0;
-    if (!softUartReadByte(b0, 30, true) || b0 != 0x05) {
+    if (!softUartReadByte(b0, 40, true) || b0 != 0x05) {
       continue;
     }
 
     noInterrupts();
-    uint8_t b1 = 0;
-    if (!softUartReadByteUnlocked(b1, true) || b1 != 0xFF) {
-      interrupts();
-      continue;
-    }
     resp[0] = 0x05;
-    resp[1] = 0xFF;
-    uint8_t n = 2;
+    uint8_t n = 1;
     for (; n < 8; n++) {
       if (!softUartReadByteUnlocked(resp[n], true)) {
         break;
@@ -405,6 +399,10 @@ uint8_t probeVersionSoft(uint8_t addr) {
       Serial.print(n);
       Serial.print(F(" "));
       continue;
+    }
+    if (resp[1] != 0xFF) {
+      Serial.print(F("echo? "));
+      continue;  // likely TX echo 05 00 06 ..., not slave reply
     }
     got = true;
     break;
@@ -549,7 +547,7 @@ void setup() {
   Serial.println(F(" ==="));
   Serial.println(F("Type v anytime to print firmware version."));
   Serial.println(F("UART: GP8-[1k]-UART_pin, GP9 same node, pull-up 1k-2.2k to 3.3V"));
-  Serial.println(F("t: soft@9600 only (v22). No HW Serial1 in t."));
+  Serial.println(F("t: soft@9600 only (v23)."));
   recreateDriver(0);
 
   if (ENABLE_PIN >= 0) {
