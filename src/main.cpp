@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v1";
+static const char *FW_VERSION = "tmc-stepper-uart-v2";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -105,19 +105,19 @@ bool probeDriver() {
     return false;
   }
 
-  uint8_t raw[16];
-  const uint8_t n = SerialTMC.rawIoinProbe(DRIVER_ADDRESS, raw, sizeof(raw));
-  Serial.print(F("  raw rx"));
-  Serial.print(n);
-  Serial.print(F(":"));
-  for (uint8_t i = 0; i < n; i++) {
-    Serial.print(F(" "));
-    Serial.print(raw[i], HEX);
+  uint8_t raw[8];
+  bool crcOk = false;
+  if (!SerialTMC.rawIoinProbe(DRIVER_ADDRESS, raw, crcOk)) {
+    Serial.println(F("  raw: no 05 FF frame"));
+  } else {
+    Serial.print(F("  raw:"));
+    for (uint8_t i = 0; i < 8; i++) {
+      Serial.print(F(" "));
+      Serial.print(raw[i], HEX);
+    }
+    Serial.println(crcOk ? F("  CRC OK") : F("  badCRC"));
+    Serial.println(F("  expect: 5 FF 6 … 21 …"));
   }
-  if (n == 0) {
-    Serial.print(F(" (none)"));
-  }
-  Serial.println();
 
   // Re-begin so TMCStepper datagram state is clean after raw probe
   SerialTMC.begin(TMC_BAUD);

@@ -1,19 +1,13 @@
 /*
   Half-duplex Stream for TMC2209 + TMCStepper on Pico single-wire UART.
 
-  Why not SoftwareSerial/Serial1 alone?
-    Those keep TX driven idle-HIGH. On this bus the TMC often cannot reply
-    through the 1k. This Stream bitbangs TX, then releases TX (high-Z) so the
-    driver can answer; RX listens on the junction. TMCStepper still owns all
-    register read/write.
-
-  TMCStepper writes 4- or 8-byte datagrams one byte at a time and never
-  flush()es — we buffer and send atomically.
+  TX: push-pull for the datagram, then release (high-Z) so the TMC can reply.
+  RX: bitbang with start-bit resync between bytes (fixed bit-count wait was
+  drifting into the next start bit → 05 FF then garbage / bad CRC).
 
   Wiring:
     txPin --[1k]--+---- TMC UART
     rxPin --------+
-                  (+ module pull-up is usually enough; external optional)
 */
 
 #pragma once
@@ -82,7 +76,6 @@ class TmcSoftUart : public Stream {
 
   using Print::write;
 
-  // Debug: GP8 jumpered to GP9, TMC disconnected.
   bool loopbackTest(uint8_t sent = 0xA5) {
     idle();
     delay(2);
@@ -98,28 +91,24 @@ class TmcSoftUart : public Stream {
     return got == sent;
   }
 
-  // Debug: send IOIN read, dump up to maxBytes of raw RX (before TMCStepper).
-  // Returns number of bytes captured into out[].
-  uint8_t rawIoinProbe(uint8_t addr, uint8_t *out, uint8_t maxBytes) {
+  // Hunt 05 FF, grab 8 bytes atomically, report CRC. Copies frame to out[8].
+  // Returns true if header+CRC OK.
+  bool rawIoinProbe(uint8_t addr, uint8_t out[8], bool &crcOk) {
+    crcOk = false;
     idle();
     delay(2);
     uint8_t req[4] = {0x05, (uint8_t)(addr & 0x03), 0x06, 0};
     req[3] = crc(req, 3);
     sendBytes(req, 4);
 
-    uint8_t n = 0;
-    const uint32_t t0 = millis();
-    while (n < maxBytes && (millis() - t0) < 200) {
-      uint8_t b = 0;
-      if (!readByte(b, 40, n == 0)) {
-        if (n > 0) {
-          break;
-        }
-        continue;
-      }
-      out[n++] = b;
+    uint8_t frame[8];
+    if (!huntReplyFrame(frame)) {
+      memset(out, 0, 8);
+      return false;
     }
-    return n;
+    memcpy(out, frame, 8);
+    crcOk = (crc(frame, 7) == frame[7]);
+    return true;
   }
 
  private:
@@ -177,7 +166,7 @@ class TmcSoftUart : public Stream {
     for (uint8_t i = 0; i < len; i++) {
       writeByteUnlocked(data[i]);
     }
-    pinMode(_tx, INPUT);  // release bus for TMC reply
+    pinMode(_tx, INPUT);
     interrupts();
 
     const uint32_t t0 = millis();
@@ -189,17 +178,25 @@ class TmcSoftUart : public Stream {
     delayMicroseconds(100);
   }
 
+  // waitFalling: resync on stop HIGH → start LOW (avoids late t0 mid-start-bit).
+  // edgeAlreadySeen: first byte after detecting start outside.
   bool readByteUnlocked(uint8_t &out, bool waitFalling) {
     if (waitFalling) {
-      const uint32_t giveUp = time_us_32() + (uint32_t)_bitUs * 30;
-      if (digitalRead(_rx) == HIGH) {
-        while (digitalRead(_rx) == HIGH) {
-          if ((int32_t)(time_us_32() - giveUp) >= 0) {
-            return false;
-          }
+      const uint32_t giveUp = time_us_32() + (uint32_t)_bitUs * 40;
+      // Complete prior stop bit (must see HIGH) before next start
+      while (digitalRead(_rx) == LOW) {
+        if ((int32_t)(time_us_32() - giveUp) >= 0) {
+          return false;
+        }
+      }
+      while (digitalRead(_rx) == HIGH) {
+        if ((int32_t)(time_us_32() - giveUp) >= 0) {
+          return false;
         }
       }
     }
+
+    // t0 = falling edge (start bit) as tightly as possible
     const uint32_t t0 = time_us_32();
     uint8_t b = 0;
     for (uint8_t i = 0; i < 8; i++) {
@@ -208,13 +205,15 @@ class TmcSoftUart : public Stream {
         b |= (uint8_t)(1u << i);
       }
     }
-    waitUntil(t0 + _bitUs * 10);
+    // Stop bit middle only — do NOT run to bit 10 (overshoots into next start)
+    waitUntil(t0 + _bitUs * 9 + (_bitUs / 2));
     out = b;
     return true;
   }
 
   bool readByte(uint8_t &out, uint32_t timeoutMs, bool requireIdleHigh) {
     const uint32_t start = millis();
+
     if (requireIdleHigh) {
       while (digitalRead(_rx) == LOW) {
         if (millis() - start > timeoutMs) {
@@ -222,29 +221,33 @@ class TmcSoftUart : public Stream {
         }
       }
     }
-    if (digitalRead(_rx) == HIGH) {
-      while (digitalRead(_rx) == HIGH) {
-        if (millis() - start > timeoutMs) {
-          return false;
-        }
+
+    // Wait for start edge, then lock IRQs immediately
+    for (;;) {
+      if (millis() - start > timeoutMs) {
+        return false;
       }
+      if (digitalRead(_rx) == HIGH) {
+        continue;
+      }
+      noInterrupts();
+      if (digitalRead(_rx) == LOW) {
+        const bool ok = readByteUnlocked(out, false);
+        interrupts();
+        return ok;
+      }
+      interrupts();
     }
-    noInterrupts();
-    const bool ok = readByteUnlocked(out, false);
-    interrupts();
-    return ok;
   }
 
-  void recvReply() {
-    _rxLen = 0;
-    _rxIdx = 0;
+  bool huntReplyFrame(uint8_t frame[8]) {
     const uint32_t huntStart = millis();
     while (millis() - huntStart < 200) {
       uint8_t b0 = 0;
       if (!readByte(b0, 40, true) || b0 != 0x05) {
         continue;
       }
-      uint8_t frame[8];
+
       frame[0] = 0x05;
       uint8_t n = 1;
       noInterrupts();
@@ -254,13 +257,28 @@ class TmcSoftUart : public Stream {
         }
       }
       interrupts();
+
       if (n < 8 || frame[1] != 0xFF) {
         continue;
       }
-      memcpy(_rxBuf, frame, 8);
-      _rxLen = 8;
-      _rxIdx = 0;
+      return true;
+    }
+    return false;
+  }
+
+  void recvReply() {
+    _rxLen = 0;
+    _rxIdx = 0;
+    uint8_t frame[8];
+    if (!huntReplyFrame(frame)) {
       return;
     }
+    // Only accept CRC-valid frames (TMCStepper also checks; avoid feeding junk)
+    if (crc(frame, 7) != frame[7]) {
+      return;
+    }
+    memcpy(_rxBuf, frame, 8);
+    _rxLen = 8;
+    _rxIdx = 0;
   }
 };
