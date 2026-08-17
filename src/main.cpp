@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v10";
+static const char *FW_VERSION = "tmc-stepper-uart-v11";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -307,9 +307,8 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
   waitStepperIdle();
 }
 
-// Two-phase test: FREE travel, then BLOCK with finger.
-// If both phases show REAL SG≈0, StallGuard is not measuring (config/mode).
-// If FREE is higher and BLOCK drops, SG works — tune y from that gap.
+// Both measurement phases EXTEND (positive delta = tip moves out) so you can
+// load the shaft end with a finger. Retract between phases to make room.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -321,23 +320,34 @@ void diagStallGuard() {
   }
 
   applyStallGuardMode();
-  Serial.println(F("d: FREE vs BLOCK StallGuard test"));
-  Serial.println(F("  Be at mid-travel. REAL = CRC ok (chip value). CRC_FAIL = UART trash."));
+  Serial.println(F("d: FREE vs BLOCK (both phases EXTEND into the tip)"));
+  Serial.println(F("  Mid-travel. REAL = chip value. CRC_FAIL = UART trash."));
 
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
+  // Make room so both phases can extend
+  Serial.println(F("  retract 500 (make room)..."));
+  stepper->move(-500);
+  waitStepperIdle();
+  delay(150);
+
   uint16_t freeMax = 0, freeMin = 0xFFFF;
   uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- PHASE 1: FREE (do not touch) ---"), 700, 16, freeMax, freeMin,
-             freeOk, freeFail);
+  runSgPhase(F("--- PHASE 1: FREE extend (do not touch) ---"), 600, 16, freeMax,
+             freeMin, freeOk, freeFail);
 
-  Serial.println(F("--- PHASE 2 in 1s: HOLD/BLOCK the actuator firmly ---"));
-  delay(1000);
+  Serial.println(F("  retract 500 (reset for block test)..."));
+  stepper->move(-500);
+  waitStepperIdle();
+
+  Serial.println(F("--- Put finger on the SHAFT TIP (extending end). 2s ---"));
+  delay(2000);
 
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- PHASE 2: BLOCKED ---"), 700, 16, blkMax, blkMin, blkOk, blkFail);
+  runSgPhase(F("--- PHASE 2: BLOCKED extend (hold tip) ---"), 600, 16, blkMax,
+             blkMin, blkOk, blkFail);
 
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
