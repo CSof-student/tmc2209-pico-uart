@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v13";
+static const char *FW_VERSION = "tmc-stepper-uart-v14";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -313,8 +313,10 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
   waitStepperIdle();
 }
 
-// Sample while EXTENDING only (same direction as serial '-' command).
-// No retract between phases — that pulled the tip away from your finger.
+// Sample while pushing the TIP OUT into your finger.
+// Empirically on this wiring, FAS positive move pulls the tip away — so
+// tip-out uses negative deltas (same as serial '+' / retract command mapping
+// was inverted relative to "extend into finger" for this actuator end).
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -326,32 +328,32 @@ void diagStallGuard() {
   }
 
   applyStallGuardMode();
-  // Match serial cmds: '+' retract = negative move, '-' extend = positive move
-  const int32_t EXTEND = 500;
-  const int32_t RETRACT = -400;
+  // Tip OUT (into finger) / tip IN (make room) — flipped from FAS +/= geometry
+  const int32_t TIP_OUT = -500;
+  const int32_t TIP_IN = 400;
 
-  Serial.println(F("d: FREE then BLOCK — both pushes EXTEND (tip out)"));
+  Serial.println(F("d: FREE then BLOCK — tip OUT into finger (dir flipped for your wiring)"));
   Serial.println(F("  REAL = chip value. CRC_FAIL = UART trash."));
 
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
-  Serial.println(F("  retract a bit (make room)..."));
-  stepper->move(RETRACT);
+  Serial.println(F("  tip IN (make room)..."));
+  stepper->move(TIP_IN);
   waitStepperIdle();
   delay(150);
 
   uint16_t freeMax = 0, freeMin = 0xFFFF;
   uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- PHASE 1: FREE extend (do not touch) ---"), EXTEND, 16, freeMax,
+  runSgPhase(F("--- PHASE 1: FREE tip-out (do not touch) ---"), TIP_OUT, 16, freeMax,
              freeMin, freeOk, freeFail);
 
-  Serial.println(F("--- Put finger on the TIP now. Extending into it in 2s ---"));
+  Serial.println(F("--- Put finger on the TIP now. Pushing OUT into it in 2s ---"));
   delay(2000);
 
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- PHASE 2: BLOCKED extend (hold tip) ---"), EXTEND, 16, blkMax,
+  runSgPhase(F("--- PHASE 2: BLOCKED tip-out (hold tip) ---"), TIP_OUT, 16, blkMax,
              blkMin, blkOk, blkFail);
 
   stepper->setSpeedInHz(moveSpeedHz);
