@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v14";
+static const char *FW_VERSION = "tmc-stepper-uart-v15";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -147,32 +147,35 @@ void applyDriverDefaults() {
   driver.begin();
   driver.pdn_disable(true);
   driver.I_scale_analog(false);
+  driver.internal_Rsense(false);
   driver.mstep_reg_select(true);
   driver.multistep_filt(true);
-  driver.en_spreadCycle(false);  // stealthChop required for StallGuard4
-  // TMC2209: TPWMTHRS==0 disables stealthChop entirely (always spreadCycle).
-  // StealthChop is active when TSTEP >= TPWMTHRS — use a small non-zero value.
-  driver.TPWMTHRS(1);
+  driver.VACTUAL(0);
+  driver.toff(4);
+  driver.blank_time(24);
   driver.rms_current(rmsMa);
   driver.microsteps(DEFAULT_MICROSTEPS);
-  driver.toff(5);
   driver.PWMCONF(0xC10D0024UL);
-  // SG/CoolStep enabled when TSTEP < TCOOLTHRS; max = enable for all practical speeds
+  driver.pwm_autoscale(true);
+  // Datasheet: TPWMTHRS=0 → StealthChop only (do NOT use 1 here)
+  driver.TPWMTHRS(0);
   driver.TCOOLTHRS(0xFFFFF);
+  driver.semin(0);
   driver.SGTHRS(sgThreshold);
-  driver.VACTUAL(0);
+  // SPREAD pin HIGH inverts en_spreadCycle. reg==pin → effective stealthChop
+  const bool spreadPin = driver.spread_en();
+  driver.en_spreadCycle(spreadPin);
+  delay(150);  // stealthChop must engage at standstill first
 
   driverConfigured = true;
   Serial.print(F("Done  rms="));
   Serial.print(rmsMa);
-  Serial.print(F("mA  SGTHRS="));
-  Serial.print(sgThreshold);
-  Serial.print(F("  TPWMTHRS="));
-  Serial.print(driver.TPWMTHRS());
-  Serial.print(F("  spreadCfg="));
-  Serial.print(driver.en_spreadCycle() ? F("on") : F("off"));
-  Serial.print(F("  stealth="));
-  Serial.println(driver.stealth() ? F("yes") : F("no"));
+  Serial.print(F("mA  SPREAD_pin="));
+  Serial.print(spreadPin ? 1 : 0);
+  Serial.print(F("  en_spread_reg="));
+  Serial.print(spreadPin ? 1 : 0);
+  Serial.print(F("  DRV.stealth="));
+  Serial.println(driver.stealth() ? 1 : 0);
 }
 
 void printHelp() {
@@ -224,12 +227,16 @@ uint16_t readStallGuard() {
 }
 
 void applyStallGuardMode() {
-  driver.en_spreadCycle(false);
-  driver.TPWMTHRS(1);  // NOT 0 — 0 disables stealthChop on TMC2209
-  driver.PWMCONF(0xC10D0024UL);
-  driver.TCOOLTHRS(0xFFFFF);
-  driver.SGTHRS(sgThreshold);
   driver.VACTUAL(0);
+  driver.TPWMTHRS(0);  // stealthChop only (datasheet)
+  driver.PWMCONF(0xC10D0024UL);
+  driver.pwm_autoscale(true);
+  driver.TCOOLTHRS(0xFFFFF);
+  driver.semin(0);
+  driver.SGTHRS(sgThreshold);
+  const bool spreadPin = driver.spread_en();
+  driver.en_spreadCycle(spreadPin);  // compensate SPREAD pin invert
+  delay(100);
 }
 
 // One SG sample with CRC labeling. Also optionally peek motion mode.
