@@ -1,10 +1,10 @@
 /*
   Pico + TMC2209 + FastAccelStepper
 
-  Uses TMCStepper with a half-duplex soft UART Stream (Serial1 hangs on this
-  single-wire bus on Pico). Call site stays simple:
+  Simple UART path: PIO SoftwareSerial (not Serial1 — that hangs on this
+  single-wire bus) + TMCStepper Stream API.
 
-    TmcSoftUart SerialTMC(8, 9);
+    SoftwareSerial SerialTMC(RX, TX);
     TMC2209Stepper driver(&SerialTMC, R_SENSE, ADDR);
     SerialTMC.begin(9600);
     driver.begin();
@@ -19,13 +19,13 @@
 */
 
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 #include <FreeRTOS.h>
 #include <task.h>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
-#include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-hw-uart-v4";
+static const char *FW_VERSION = "tmc-swserial-v1";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -43,7 +43,10 @@ static const uint32_t DEFAULT_SPEED_HZ = 200;
 static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 200;
 
-TmcSoftUart SerialTMC(TMC_TX_PIN, TMC_RX_PIN);
+// SoftwareSerial(rx, tx) — Pico core uses PIO under the hood.
+// Pass as Stream* so TMCStepper does NOT call .end() after every read
+// (that only happens on its internal SWSerial pin constructor path).
+SoftwareSerial SerialTMC(TMC_RX_PIN, TMC_TX_PIN);
 TMC2209Stepper driver(&SerialTMC, R_SENSE, DRIVER_ADDRESS);
 
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -82,6 +85,10 @@ bool beginTmcUart() {
   }
 
   SerialTMC.begin(TMC_BAUD);
+  delay(10);
+  while (SerialTMC.available()) {
+    SerialTMC.read();
+  }
   uartReady = true;
   return true;
 }
@@ -411,7 +418,7 @@ void setup() {
   Serial.print(F("=== FW "));
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
-  Serial.println(F("TMCStepper + TmcSoftUart @9600 (Serial1 avoided — hangs on Pico half-duplex)"));
+  Serial.println(F("TMCStepper + SoftwareSerial (PIO) @9600"));
 
   if (ENABLE_PIN >= 0) {
     pinMode(ENABLE_PIN, OUTPUT);
