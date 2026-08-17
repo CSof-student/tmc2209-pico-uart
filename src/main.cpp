@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v2";
+static const char *FW_VERSION = "tmc-stepper-uart-v3";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;

@@ -29,7 +29,6 @@ class TmcSoftUart : public Stream {
     _txCount = 0;
     _rxLen = 0;
     _rxIdx = 0;
-    _awaitingReply = false;
   }
 
   void end() { idle(); }
@@ -45,13 +44,7 @@ class TmcSoftUart : public Stream {
 
   int read() override {
     if (_rxIdx >= _rxLen) {
-      if (_awaitingReply) {
-        _awaitingReply = false;
-        recvReply();
-      }
-      if (_rxIdx >= _rxLen) {
-        return -1;
-      }
+      return -1;
     }
     return _rxBuf[_rxIdx++];
   }
@@ -69,7 +62,11 @@ class TmcSoftUart : public Stream {
       _rxLen = 0;
       _rxIdx = 0;
       sendBytes(_txBuf, n);
-      _awaitingReply = (n == 4);
+      // Prefetch like a HW UART FIFO: capture reply now so TMCStepper
+      // available()/read() see bytes immediately (raw probe path that works).
+      if (n == 4) {
+        recvReply();
+      }
     }
     return 1;
   }
@@ -120,7 +117,6 @@ class TmcSoftUart : public Stream {
   uint8_t _rxBuf[16];
   uint8_t _rxLen = 0;
   uint8_t _rxIdx = 0;
-  bool _awaitingReply = false;
 
   static inline void waitUntil(uint32_t deadline) {
     while ((int32_t)(time_us_32() - deadline) < 0) {
