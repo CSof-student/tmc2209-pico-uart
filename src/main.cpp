@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v21";
+static const char *FW_VERSION = "tmc-stepper-uart-v22";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -56,7 +56,11 @@ bool uartReady = false;
 bool driverConfigured = false;
 String line;
 
-uint8_t sgThreshold = 5;  // must be BELOW free sgMax (~12). y 20 can never trip on this motor.
+// This actuator's SG polarity is inverted vs datasheet:
+//   free / mid-travel → low SG (~0..10)
+//   blocked / end      → high SG (~40+)
+// Homing trips in software when SG >= y (not the usual SG < SGTHRS).
+uint8_t sgThreshold = 20;  // stall when SG rises to this (between freeMax and blockMin)
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
@@ -67,7 +71,7 @@ static const int32_t HOME_MAX_TRAVEL = 20000;
 static const int32_t HOME_MIN_TRAVEL = 200;
 static const uint8_t HOME_IGNORE_CHUNKS = 8;
 static const uint8_t HOME_STALL_HITS = 3;
-static const uint16_t HOME_ARM_SG = 6;  // free motion on this setup reaches ~8..12
+static const uint16_t HOME_ARM_SG = 12;  // arm after seeing free (low) SG <= this
 static const uint32_t HOME_SPEED_HZ = 400;  // slower = cleaner soft-UART SG reads
 static const uint32_t HOME_ACCEL = 600;
 
@@ -183,7 +187,7 @@ void printHelp() {
   Serial.println(F("  h/? help   v version   t UART probe   b loopback   u defaults"));
   Serial.println(F("  c <mA>  m <usteps>  i status"));
   Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
-  Serial.println(F("  z SG read   y <0-255> SG thresh   d FREE vs BLOCK SG test   H home"));
+  Serial.println(F("  z SG read   y <N> stall if SG>=N (inverted)   d FREE/BLOCK   H home"));
 }
 
 void printMotionStatus() {
@@ -377,7 +381,7 @@ void diagStallGuard() {
   const int32_t TIP_OUT = -1500;
   const int32_t TIP_IN = 700;
 
-  Serial.println(F("d: FREE + BLOCK both tip OUT (FAS -)"));
+  Serial.println(F("d: FREE + BLOCK tip OUT — expect free LOW, block HIGH"));
   Serial.println(F("  Watch '>>> tip OUT' — tip must push outward."));
 
   stepper->setSpeedInHz(500);
@@ -396,8 +400,7 @@ void diagStallGuard() {
   runSgPhase(F("--- FREE ---"), TIP_OUT, 50, freeMax, freeMin, freeOk, freeFail);
 
   if (freeMax < 15) {
-    Serial.println(F("  Free SG still low — likely already near extend end."));
-    Serial.println(F("  Manually retract toward mid, then d again."));
+    Serial.println(F("  Note: free SG low is normal on this unit (inverted)."));
   }
 
   Serial.println(F("  (prep) tip IN..."));
@@ -418,7 +421,7 @@ void diagStallGuard() {
   stepper->setAcceleration(moveAccel);
   applyStallGuardMode();
 
-  Serial.println(F("=== SUMMARY ==="));
+  Serial.println(F("=== SUMMARY (inverted SG: free low, block high) ==="));
   Serial.print(F("  FREE  sg="));
   Serial.print(freeMin == 0xFFFF ? 0 : freeMin);
   Serial.print(F(".."));
@@ -428,24 +431,26 @@ void diagStallGuard() {
   Serial.print(F(".."));
   Serial.println(blkMax);
 
-  if (freeOk < 5) {
+  if (freeOk < 5 || blkOk < 5) {
     Serial.println(F("  Verdict: too few samples"));
-  } else if (freeMax < 15) {
-    Serial.println(F("  Verdict: free SG too low — start more retracted, rerun d"));
+  } else if (blkMax > freeMax + 8) {
+    int y = (int)((freeMax + blkMax) / 2);
+    if (y <= (int)freeMax + 2) {
+      y = (int)freeMax + 5;
+    }
+    Serial.print(F("  Verdict: OK — stall when SG rises. try y "));
+    Serial.println(y);
+    Serial.println(F("  Then H from mid-travel."));
   } else if (freeMax > blkMax + 8) {
-    const int y = (int)((blkMax + freeMin) / 2);
-    Serial.print(F("  Verdict: SG responds — try y "));
-    Serial.println(y > 2 ? y : 3);
-  } else if (blkMax >= freeMax) {
-    Serial.println(F("  Verdict: BLOCK not lower than FREE — hold tip firmer / check tip really OUT"));
+    Serial.println(F("  Verdict: classic polarity (free high) — unexpected on this unit"));
   } else {
-    Serial.println(F("  Verdict: weak contrast"));
+    Serial.println(F("  Verdict: weak contrast — hold tip firmer on BLOCK"));
   }
 }
 
 // Poll SG while stepping.
-// y must be < free sgMax (≈12). If UART keeps failing we never arm and
-// would run forever — abort when CRC fail rate is too high.
+// Inverted polarity: arm on free (low SG), stall when SG >= y.
+// Abort if UART CRC fail rate is too high.
 bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stepper || maxSteps <= 0) {
     return false;
@@ -457,10 +462,11 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
 
   int32_t moved = 0;
   uint8_t chunkIdx = 0;
-  uint8_t lowHits = 0;
+  uint8_t highHits = 0;
   bool armed = false;
   bool stalled = false;
   uint16_t seenMax = 0;
+  uint16_t seenMin = 0xFFFF;
   uint16_t goodReads = 0;
   uint16_t badReads = 0;
   delay(150);
@@ -492,11 +498,15 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
         if (sg > seenMax) {
           seenMax = sg;
         }
-        if (!armed && sg >= HOME_ARM_SG) {
+        if (sg < seenMin) {
+          seenMin = sg;
+        }
+        // Arm once we have seen free (low) SG
+        if (!armed && sg <= HOME_ARM_SG) {
           armed = true;
         }
       }
-      delay(20);  // fewer, more reliable polls
+      delay(20);
     }
 
     const int32_t stepped = abs(stepper->getCurrentPosition() - pos0);
@@ -519,7 +529,6 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
-    // Too many CRC failures → hand-stall can never be seen
     if (badReads > 30 && goodReads * 2 < badReads) {
       Serial.println(F("  ABORT: UART SG reads failing — not safe to home"));
       stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
@@ -530,20 +539,19 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
 
     if (chunkIdx < HOME_IGNORE_CHUNKS || !armed) {
       Serial.println(armed ? F(" (ignore)") : F(" (arming)"));
-      lowHits = 0;
-    } else if (chunkGood > 0 && sgMin <= (uint16_t)sgThreshold) {
-      // Trip on low samples (hand/end). Require a few chunks in a row.
-      lowHits++;
-      Serial.print(F(" low "));
-      Serial.print(lowHits);
+      highHits = 0;
+    } else if (chunkGood > 0 && sgMaxChunk >= (uint16_t)sgThreshold) {
+      highHits++;
+      Serial.print(F(" high "));
+      Serial.print(highHits);
       Serial.print(F("/"));
       Serial.println(HOME_STALL_HITS);
-      if (lowHits >= HOME_STALL_HITS) {
+      if (highHits >= HOME_STALL_HITS) {
         stalled = true;
         break;
       }
     } else {
-      lowHits = 0;
+      highHits = 0;
       Serial.println();
     }
 
@@ -551,11 +559,11 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   }
 
   if (!stalled && !armed) {
-    Serial.print(F("  never armed (sg max seen "));
+    Serial.print(F("  never armed (sg min/max seen "));
+    Serial.print(seenMin == 0xFFFF ? 0 : seenMin);
+    Serial.print(F("/"));
     Serial.print(seenMax);
-    Serial.print(F(", goodReads="));
-    Serial.print(goodReads);
-    Serial.println(F(") — check UART / mid-travel / y < free sgMax"));
+    Serial.println(F(") — need free (low) SG first; start mid-travel"));
   }
 
   if (stalled) {
@@ -580,14 +588,15 @@ void homeBothEnds() {
   }
 
   Serial.println(F("StallGuard home (+retract / -extend)..."));
-  Serial.println(F("  Tip: start near mid-travel (not jammed). Run d first; need sgMax > y."));
+  Serial.println(F("  Inverted SG: free=low, end=high. Stall when SG >= y."));
+  Serial.println(F("  Start mid-travel. Run d first to pick y."));
   applyStallGuardMode();
-  Serial.print(F("SGTHRS="));
+  Serial.print(F("SG trip>="));
   Serial.println(sgThreshold);
 
   Serial.println(F("Seeking RETRACTED (+) ..."));
   if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
-    Serial.println(F("RETRACT: no stall — try higher y"));
+    Serial.println(F("RETRACT: no stall — try lower y / start mid-travel"));
     travelCalibrated = false;
     return;
   }
@@ -598,7 +607,7 @@ void homeBothEnds() {
 
   Serial.println(F("Seeking EXTENDED (-) ..."));
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
-    Serial.println(F("EXTEND: no stall — try higher y"));
+    Serial.println(F("EXTEND: no stall — try lower y"));
     travelCalibrated = false;
     return;
   }
@@ -611,7 +620,7 @@ void homeBothEnds() {
   Serial.println(travelMax);
 
   if (travelMax < HOME_MIN_TRAVEL) {
-    Serial.println(F("Travel too short — lower y, then H"));
+    Serial.println(F("Travel too short — raise y (less sensitive), then H"));
     travelCalibrated = false;
     return;
   }
@@ -654,9 +663,9 @@ void processCommand(String cmd) {
     const bool moving = stepper && stepper->isRunning();
     Serial.print(F("SG_RESULT="));
     Serial.print(readStallGuard());
-    Serial.print(F("  SGTHRS="));
+    Serial.print(F("  trip>="));
     Serial.print(sgThreshold);
-    Serial.println(moving ? F("  (moving)") : F("  (idle — SG often ~0; use H for live sgMin)"));
+    Serial.println(moving ? F("  (moving)") : F("  (idle — SG often ~0; sample while moving)"));
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
@@ -664,12 +673,9 @@ void processCommand(String cmd) {
       if (uartReady) {
         driver.SGTHRS(sgThreshold);
       }
-      Serial.print(F("SGTHRS="));
+      Serial.print(F("SG_TRIP>="));
       Serial.print(sgThreshold);
-      if (sgThreshold >= 12) {
-        Serial.print(F("  WARNING: free sgMax is ~12 — use y 3..6 or hand-stall won't trip"));
-      }
-      Serial.println();
+      Serial.println(F("  (software; stall when SG rises)"));
     }
   } else if (c == 'g' || c == 'G') {
     int32_t dest = cmd.substring(1).toInt();
