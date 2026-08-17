@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v23";
+static const char *FW_VERSION = "tmc-stepper-uart-v24";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -358,7 +358,7 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSampl
 }
 
 // Classic StallGuard: free = high SG, block = low SG.
-// Probe both directions for free, then block the better free direction.
+// Always tip OUT for free+block (same FAS sign as serial '-').
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -377,51 +377,31 @@ void diagStallGuard() {
   driver.microsteps(8);
   applyStallGuardMode();
 
-  // Absolute FAS: same as H. + = tip IN, - = tip OUT.
-  const int32_t TIP_OUT = -1200;
-  const int32_t TIP_IN = 600;
+  // Match serial jog: '+' = move(-) retract/tip IN; '-' = move(+) extend/tip OUT
+  const int32_t TIP_OUT = 1200;
+  const int32_t TIP_IN = -600;
 
-  Serial.println(F("d: classic SG — FREE should be HIGH, BLOCK low"));
-  Serial.println(F("  Start mid-travel. Tip must be free both ways."));
+  Serial.println(F("d: classic SG — FREE high, BLOCK low; tip OUT only"));
+  Serial.println(F("  Start mid-travel. If tip goes IN on >>> OUT, stop and say so."));
 
   stepper->setSpeedInHz(400);
   stepper->setAcceleration(600);
 
-  Serial.println(F("  (prep) tip IN..."));
+  Serial.println(F("  (prep) tip IN / retract (make room)..."));
   stepper->move(TIP_IN);
   waitStepperIdle();
-  delay(150);
+  delay(200);
 
-  uint16_t freeOutMax = 0, freeOutMin = 0xFFFF;
-  uint8_t freeOutOk = 0, freeOutFail = 0;
-  Serial.println(F(">>> FREE tip OUT (do not touch)"));
-  runSgPhase(F("--- FREE tip OUT ---"), TIP_OUT, 40, freeOutMax, freeOutMin, freeOutOk,
-             freeOutFail);
+  Serial.println(F(">>> FREE tip OUT — same as serial '-', do not touch"));
+  delay(400);
 
-  uint16_t freeInMax = 0, freeInMin = 0xFFFF;
-  uint8_t freeInOk = 0, freeInFail = 0;
-  Serial.println(F(">>> FREE tip IN (do not touch)"));
-  runSgPhase(F("--- FREE tip IN ---"), TIP_IN, 40, freeInMax, freeInMin, freeInOk,
-             freeInFail);
-
-  const bool preferOut = (freeOutMax >= freeInMax);
-  const uint16_t freeMax = preferOut ? freeOutMax : freeInMax;
-  const uint16_t freeMin = preferOut
-                               ? (freeOutMin == 0xFFFF ? 0 : freeOutMin)
-                               : (freeInMin == 0xFFFF ? 0 : freeInMin);
-  const int32_t blockDir = preferOut ? TIP_OUT : TIP_IN;
-  const uint8_t freeOk = preferOut ? freeOutOk : freeInOk;
-
-  Serial.print(F("  best free dir="));
-  Serial.print(preferOut ? F("OUT") : F("IN"));
-  Serial.print(F(" sg="));
-  Serial.print(freeMin);
-  Serial.print(F(".."));
-  Serial.println(freeMax);
+  uint16_t freeMax = 0, freeMin = 0xFFFF;
+  uint8_t freeOk = 0, freeFail = 0;
+  runSgPhase(F("--- FREE tip OUT ---"), TIP_OUT, 50, freeMax, freeMin, freeOk, freeFail);
 
   if (freeMax < 15) {
-    Serial.println(F("  Free SG still low both ways — not mid-travel / jammed."));
-    Serial.println(F("  Jog +/- until tip moves freely, then d again."));
+    Serial.println(F("  Free SG low — tip likely against extend end, or not mid-travel."));
+    Serial.println(F("  Jog serial + (retract) toward mid, then d again."));
     driver.microsteps(DEFAULT_MICROSTEPS);
     driver.rms_current(oldMa);
     stepper->setSpeedInHz(moveSpeedHz);
@@ -430,17 +410,17 @@ void diagStallGuard() {
     return;
   }
 
-  Serial.println(F("  (prep) backoff..."));
-  stepper->move(-blockDir / 2);
+  Serial.println(F("  (prep) tip IN a bit..."));
+  stepper->move(TIP_IN);
   waitStepperIdle();
 
-  Serial.println(F("--- Finger on TIP. 2s — resist the next move ---"));
+  Serial.println(F("--- Finger on TIP. 2s — next move pushes OUT into finger ---"));
   delay(2000);
 
-  Serial.println(F(">>> BLOCK (hold tip)"));
+  Serial.println(F(">>> BLOCK tip OUT — hold tip (must push outward)"));
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- BLOCK ---"), blockDir, 40, blkMax, blkMin, blkOk, blkFail);
+  runSgPhase(F("--- BLOCK tip OUT ---"), TIP_OUT, 50, blkMax, blkMin, blkOk, blkFail);
 
   driver.microsteps(DEFAULT_MICROSTEPS);
   driver.rms_current(oldMa);
@@ -450,7 +430,7 @@ void diagStallGuard() {
 
   Serial.println(F("=== SUMMARY (classic: free HIGH, block LOW) ==="));
   Serial.print(F("  FREE  sg="));
-  Serial.print(freeMin);
+  Serial.print(freeMin == 0xFFFF ? 0 : freeMin);
   Serial.print(F(".."));
   Serial.println(freeMax);
   Serial.print(F("  BLOCK sg="));
@@ -471,11 +451,11 @@ void diagStallGuard() {
     if (y < 1) {
       y = 1;
     }
-    Serial.print(F("  Verdict: OK — stall when SG drops. try y "));
+    Serial.print(F("  Verdict: OK — try y "));
     Serial.println(y);
     Serial.println(F("  Then H from mid-travel."));
   } else if (blkMax >= freeMax) {
-    Serial.println(F("  Verdict: BLOCK not lower — hold tip firmer, or free was still loaded"));
+    Serial.println(F("  Verdict: BLOCK not lower — hold tip firmer / check tip really OUT"));
   } else {
     Serial.println(F("  Verdict: weak contrast — rerun from true mid-travel"));
   }
@@ -618,8 +598,8 @@ void homeBothEnds() {
   Serial.print(F("SGTHRS/y="));
   Serial.println(sgThreshold);
 
-  Serial.println(F("Seeking RETRACTED (+) ..."));
-  if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
+  Serial.println(F("Seeking RETRACTED (+) = FAS - ..."));
+  if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
     Serial.println(F("RETRACT: no stall — try higher y / start mid-travel"));
     travelCalibrated = false;
     return;
@@ -629,15 +609,15 @@ void homeBothEnds() {
   Serial.println(F("Retracted end = 0"));
   delay(100);
 
-  Serial.println(F("Seeking EXTENDED (-) ..."));
-  if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
+  Serial.println(F("Seeking EXTENDED (-) = FAS + ..."));
+  if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
     Serial.println(F("EXTEND: no stall — try higher y"));
     travelCalibrated = false;
     return;
   }
 
   const int32_t raw = stepper->getCurrentPosition();
-  travelMax = -raw;
+  travelMax = raw;
   Serial.print(F("  rawPos="));
   Serial.print(raw);
   Serial.print(F(" → travelMax="));
