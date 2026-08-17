@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v4";
+static const char *FW_VERSION = "tmc-stepper-uart-v5";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -67,8 +67,8 @@ static const int32_t HOME_MAX_TRAVEL = 20000;
 static const int32_t HOME_MIN_TRAVEL = 200;
 static const uint8_t HOME_IGNORE_CHUNKS = 4;
 static const uint8_t HOME_STALL_HITS = 2;
-static const uint32_t HOME_SPEED_HZ = 150;
-static const uint32_t HOME_ACCEL = 300;
+static const uint32_t HOME_SPEED_HZ = 500;
+static const uint32_t HOME_ACCEL = 800;
 
 uint32_t moveSpeedHz = DEFAULT_SPEED_HZ;
 int32_t moveAccel = DEFAULT_ACCEL;
@@ -146,19 +146,27 @@ void applyDriverDefaults() {
   driver.begin();
   driver.pdn_disable(true);
   driver.I_scale_analog(false);
+  driver.mstep_reg_select(true);
+  driver.multistep_filt(true);
+  driver.en_spreadCycle(false);  // stealthChop required for StallGuard4
+  driver.TPWMTHRS(0);            // stay in stealthChop at all speeds
   driver.rms_current(rmsMa);
   driver.microsteps(DEFAULT_MICROSTEPS);
-  driver.pwm_autoscale(true);
-  driver.en_spreadCycle(false);
   driver.toff(5);
-  driver.TCOOLTHRS(0xFFFFF);
+  // Same PWMCONF as working main soft-UART path (autoscale + autograd)
+  driver.PWMCONF(0xC10D0024UL);
+  driver.TCOOLTHRS(0xFFFFF);  // StallGuard enabled for practical TSTEP values
   driver.SGTHRS(sgThreshold);
 
   driverConfigured = true;
   Serial.print(F("Done  rms="));
   Serial.print(rmsMa);
   Serial.print(F("mA  SGTHRS="));
-  Serial.println(sgThreshold);
+  Serial.print(sgThreshold);
+  Serial.print(F("  spread="));
+  Serial.print(driver.en_spreadCycle() ? F("on") : F("off"));
+  Serial.print(F("  stealth="));
+  Serial.println(driver.stealth() ? F("yes") : F("no"));
 }
 
 void printHelp() {
@@ -166,7 +174,7 @@ void printHelp() {
   Serial.println(F("  h/? help   v version   t UART probe   b loopback   u defaults"));
   Serial.println(F("  c <mA>  m <usteps>  i status"));
   Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
-  Serial.println(F("  z SG read   y <0-255> SG thresh   H home ends"));
+  Serial.println(F("  z SG read   y <0-255> SG thresh   d SG diag move   H home ends"));
 }
 
 void printMotionStatus() {
@@ -197,7 +205,66 @@ uint16_t readStallGuard() {
   if (!uartReady) {
     return 0xFFFF;
   }
-  return driver.SG_RESULT();
+  driver.CRCerror = false;
+  const uint16_t v = (uint16_t)(driver.SG_RESULT() & 0x3FF);
+  if (driver.CRCerror) {
+    return 0xFFFF;
+  }
+  return v;
+}
+
+// Live StallGuard tune: move while printing SG / TSTEP / mode.
+// Free motion should show SG well above SGTHRS (often 50–400+), not 0–2.
+void diagStallGuard() {
+  if (!stepper) {
+    Serial.println(F("no stepper"));
+    return;
+  }
+  if (!driverConfigured) {
+    Serial.println(F("run u first"));
+    return;
+  }
+
+  driver.TCOOLTHRS(0xFFFFF);
+  driver.TPWMTHRS(0);
+  driver.en_spreadCycle(false);
+  driver.SGTHRS(sgThreshold);
+
+  Serial.println(F("d: move + poll SG (should rise while free-running)"));
+  Serial.print(F("  SGTHRS="));
+  Serial.print(sgThreshold);
+  Serial.print(F("  stealth="));
+  Serial.print(driver.stealth() ? F("1") : F("0"));
+  Serial.print(F("  spreadIO="));
+  Serial.println(driver.spread_en() ? F("1") : F("0"));
+
+  stepper->setSpeedInHz(HOME_SPEED_HZ);
+  stepper->setAcceleration(HOME_ACCEL);
+  stepper->move(-800);  // extend a bit
+
+  uint8_t n = 0;
+  while (stepper->isRunning() && n < 40) {
+    driver.CRCerror = false;
+    const uint16_t sg = (uint16_t)(driver.SG_RESULT() & 0x3FF);
+    const bool crcFail = driver.CRCerror;
+    const uint32_t tstep = driver.TSTEP();
+    Serial.print(F("  sg="));
+    Serial.print(sg);
+    Serial.print(F(" tstep="));
+    Serial.print(tstep);
+    Serial.print(F(" stealth="));
+    Serial.print(driver.stealth() ? F("1") : F("0"));
+    if (crcFail) {
+      Serial.print(F(" CRC_FAIL"));
+    }
+    Serial.println();
+    n++;
+    delay(30);
+  }
+  waitStepperIdle();
+  stepper->setSpeedInHz(moveSpeedHz);
+  stepper->setAcceleration(moveAccel);
+  Serial.println(F("d: done — if sg stays 0..2 and tstep=1048575, steps aren't seen / not stealthChop"));
 }
 
 // Poll SG_RESULT while stepping. StallGuard is invalid when standing still
@@ -235,7 +302,11 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     moved += (stepped > 0) ? stepped : chunk;
 
     Serial.print(F("  sgMin="));
-    Serial.print(sgMin == 0xFFFF ? 0 : sgMin);
+    if (sgMin == 0xFFFF) {
+      Serial.print(F("crcFail"));
+    } else {
+      Serial.print(sgMin);
+    }
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
@@ -340,6 +411,8 @@ void processCommand(String cmd) {
     Serial.println(FW_VERSION);
   } else if (c == 'b' || c == 'B') {
     loopbackCommand();
+  } else if (c == 'd' || c == 'D') {
+    diagStallGuard();
   } else if (c == 't' || c == 'T') {
     if (probeDriver()) {
       Serial.println(F("t: OK"));
