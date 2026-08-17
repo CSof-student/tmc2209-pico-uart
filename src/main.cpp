@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v3";
+static const char *FW_VERSION = "tmc-stepper-uart-v4";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -200,6 +200,8 @@ uint16_t readStallGuard() {
   return driver.SG_RESULT();
 }
 
+// Poll SG_RESULT while stepping. StallGuard is invalid when standing still
+// (idle reads often 0..2) — that was why mid-test looked stuck low.
 bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stepper || maxSteps <= 0) {
     return false;
@@ -217,20 +219,30 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   while (moved < maxSteps) {
     const int32_t chunk =
         (maxSteps - moved > HOME_CHUNK) ? HOME_CHUNK : (maxSteps - moved);
+    const int32_t pos0 = stepper->getCurrentPosition();
     stepper->move((int32_t)dirSign * chunk);
-    waitStepperIdle();
-    delay(15);
 
-    const uint16_t sg = readStallGuard();
-    Serial.print(F("  sg="));
-    Serial.print(sg);
+    uint16_t sgMin = 0xFFFF;
+    while (stepper->isRunning()) {
+      const uint16_t sg = readStallGuard();
+      if (sg != 0xFFFF && sg < sgMin) {
+        sgMin = sg;
+      }
+      delay(4);
+    }
+
+    const int32_t stepped = abs(stepper->getCurrentPosition() - pos0);
+    moved += (stepped > 0) ? stepped : chunk;
+
+    Serial.print(F("  sgMin="));
+    Serial.print(sgMin == 0xFFFF ? 0 : sgMin);
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
     if (chunkIdx < HOME_IGNORE_CHUNKS) {
       Serial.println(F(" (ignore)"));
       lowHits = 0;
-    } else if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
+    } else if (sgMin != 0xFFFF && sgMin <= (uint16_t)sgThreshold) {
       lowHits++;
       Serial.print(F(" low "));
       Serial.print(lowHits);
@@ -245,7 +257,6 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
       Serial.println();
     }
 
-    moved += chunk;
     chunkIdx++;
   }
 
@@ -340,10 +351,12 @@ void processCommand(String cmd) {
   } else if (c == 'p' || c == 'P') {
     printMotionStatus();
   } else if (c == 'z' || c == 'Z') {
+    const bool moving = stepper && stepper->isRunning();
     Serial.print(F("SG_RESULT="));
     Serial.print(readStallGuard());
     Serial.print(F("  SGTHRS="));
-    Serial.println(sgThreshold);
+    Serial.print(sgThreshold);
+    Serial.println(moving ? F("  (moving)") : F("  (idle — SG often ~0; use H for live sgMin)"));
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
