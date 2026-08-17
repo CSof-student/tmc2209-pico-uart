@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v22";
+static const char *FW_VERSION = "tmc-stepper-uart-v23";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -56,11 +56,11 @@ bool uartReady = false;
 bool driverConfigured = false;
 String line;
 
-// This actuator's SG polarity is inverted vs datasheet:
-//   free / mid-travel → low SG (~0..10)
-//   blocked / end      → high SG (~40+)
-// Homing trips in software when SG >= y (not the usual SG < SGTHRS).
-uint8_t sgThreshold = 20;  // stall when SG rises to this (between freeMax and blockMin)
+// Classic StallGuard polarity (datasheet):
+//   free / mid-travel → high SG
+//   blocked / end      → low SG
+// Homing trips in software when SG <= y (same sense as SGTHRS).
+uint8_t sgThreshold = 6;  // stall when SG drops to this (below freeMin, above blockMax)
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
@@ -71,7 +71,7 @@ static const int32_t HOME_MAX_TRAVEL = 20000;
 static const int32_t HOME_MIN_TRAVEL = 200;
 static const uint8_t HOME_IGNORE_CHUNKS = 8;
 static const uint8_t HOME_STALL_HITS = 3;
-static const uint16_t HOME_ARM_SG = 12;  // arm after seeing free (low) SG <= this
+static const uint16_t HOME_ARM_SG = 15;  // arm after seeing free (high) SG >= this
 static const uint32_t HOME_SPEED_HZ = 400;  // slower = cleaner soft-UART SG reads
 static const uint32_t HOME_ACCEL = 600;
 
@@ -187,7 +187,7 @@ void printHelp() {
   Serial.println(F("  h/? help   v version   t UART probe   b loopback   u defaults"));
   Serial.println(F("  c <mA>  m <usteps>  i status"));
   Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
-  Serial.println(F("  z SG read   y <N> stall if SG>=N (inverted)   d FREE/BLOCK   H home"));
+  Serial.println(F("  z SG read   y <N> stall if SG<=N (classic)   d FREE/BLOCK   H home"));
 }
 
 void printMotionStatus() {
@@ -357,8 +357,8 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSampl
   Serial.println(outMax);
 }
 
-// Always push TIP OUT for free + block.
-// Absolute FAS (matches H): +1 = retract/tip IN, -1 = extend/tip OUT.
+// Classic StallGuard: free = high SG, block = low SG.
+// Probe both directions for free, then block the better free direction.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -377,43 +377,70 @@ void diagStallGuard() {
   driver.microsteps(8);
   applyStallGuardMode();
 
-  // Absolute FAS: same as H. Empirically + = tip IN, - = tip OUT.
-  const int32_t TIP_OUT = -1500;
-  const int32_t TIP_IN = 700;
+  // Absolute FAS: same as H. + = tip IN, - = tip OUT.
+  const int32_t TIP_OUT = -1200;
+  const int32_t TIP_IN = 600;
 
-  Serial.println(F("d: FREE + BLOCK tip OUT — expect free LOW, block HIGH"));
-  Serial.println(F("  Watch '>>> tip OUT' — tip must push outward."));
+  Serial.println(F("d: classic SG — FREE should be HIGH, BLOCK low"));
+  Serial.println(F("  Start mid-travel. Tip must be free both ways."));
 
-  stepper->setSpeedInHz(500);
-  stepper->setAcceleration(700);
+  stepper->setSpeedInHz(400);
+  stepper->setAcceleration(600);
 
   Serial.println(F("  (prep) tip IN..."));
   stepper->move(TIP_IN);
   waitStepperIdle();
-  delay(200);
+  delay(150);
 
-  Serial.println(F(">>> tip OUT now — FREE (do not touch)"));
-  delay(500);
+  uint16_t freeOutMax = 0, freeOutMin = 0xFFFF;
+  uint8_t freeOutOk = 0, freeOutFail = 0;
+  Serial.println(F(">>> FREE tip OUT (do not touch)"));
+  runSgPhase(F("--- FREE tip OUT ---"), TIP_OUT, 40, freeOutMax, freeOutMin, freeOutOk,
+             freeOutFail);
 
-  uint16_t freeMax = 0, freeMin = 0xFFFF;
-  uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- FREE ---"), TIP_OUT, 50, freeMax, freeMin, freeOk, freeFail);
+  uint16_t freeInMax = 0, freeInMin = 0xFFFF;
+  uint8_t freeInOk = 0, freeInFail = 0;
+  Serial.println(F(">>> FREE tip IN (do not touch)"));
+  runSgPhase(F("--- FREE tip IN ---"), TIP_IN, 40, freeInMax, freeInMin, freeInOk,
+             freeInFail);
+
+  const bool preferOut = (freeOutMax >= freeInMax);
+  const uint16_t freeMax = preferOut ? freeOutMax : freeInMax;
+  const uint16_t freeMin = preferOut
+                               ? (freeOutMin == 0xFFFF ? 0 : freeOutMin)
+                               : (freeInMin == 0xFFFF ? 0 : freeInMin);
+  const int32_t blockDir = preferOut ? TIP_OUT : TIP_IN;
+  const uint8_t freeOk = preferOut ? freeOutOk : freeInOk;
+
+  Serial.print(F("  best free dir="));
+  Serial.print(preferOut ? F("OUT") : F("IN"));
+  Serial.print(F(" sg="));
+  Serial.print(freeMin);
+  Serial.print(F(".."));
+  Serial.println(freeMax);
 
   if (freeMax < 15) {
-    Serial.println(F("  Note: free SG low is normal on this unit (inverted)."));
+    Serial.println(F("  Free SG still low both ways — not mid-travel / jammed."));
+    Serial.println(F("  Jog +/- until tip moves freely, then d again."));
+    driver.microsteps(DEFAULT_MICROSTEPS);
+    driver.rms_current(oldMa);
+    stepper->setSpeedInHz(moveSpeedHz);
+    stepper->setAcceleration(moveAccel);
+    applyStallGuardMode();
+    return;
   }
 
-  Serial.println(F("  (prep) tip IN..."));
-  stepper->move(TIP_IN);
+  Serial.println(F("  (prep) backoff..."));
+  stepper->move(-blockDir / 2);
   waitStepperIdle();
 
-  Serial.println(F("--- Finger on TIP. 2s, then tip OUT into finger ---"));
+  Serial.println(F("--- Finger on TIP. 2s — resist the next move ---"));
   delay(2000);
 
-  Serial.println(F(">>> tip OUT now — BLOCK (hold tip)"));
+  Serial.println(F(">>> BLOCK (hold tip)"));
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- BLOCK ---"), TIP_OUT, 50, blkMax, blkMin, blkOk, blkFail);
+  runSgPhase(F("--- BLOCK ---"), blockDir, 40, blkMax, blkMin, blkOk, blkFail);
 
   driver.microsteps(DEFAULT_MICROSTEPS);
   driver.rms_current(oldMa);
@@ -421,9 +448,9 @@ void diagStallGuard() {
   stepper->setAcceleration(moveAccel);
   applyStallGuardMode();
 
-  Serial.println(F("=== SUMMARY (inverted SG: free low, block high) ==="));
+  Serial.println(F("=== SUMMARY (classic: free HIGH, block LOW) ==="));
   Serial.print(F("  FREE  sg="));
-  Serial.print(freeMin == 0xFFFF ? 0 : freeMin);
+  Serial.print(freeMin);
   Serial.print(F(".."));
   Serial.println(freeMax);
   Serial.print(F("  BLOCK sg="));
@@ -433,24 +460,28 @@ void diagStallGuard() {
 
   if (freeOk < 5 || blkOk < 5) {
     Serial.println(F("  Verdict: too few samples"));
-  } else if (blkMax > freeMax + 8) {
-    int y = (int)((freeMax + blkMax) / 2);
-    if (y <= (int)freeMax + 2) {
-      y = (int)freeMax + 5;
+  } else if (freeMax > blkMax + 8) {
+    int y = (int)((blkMax + freeMin) / 2);
+    if (y < 2) {
+      y = 2;
     }
-    Serial.print(F("  Verdict: OK — stall when SG rises. try y "));
+    if (y >= (int)freeMin) {
+      y = (int)freeMin - 2;
+    }
+    if (y < 1) {
+      y = 1;
+    }
+    Serial.print(F("  Verdict: OK — stall when SG drops. try y "));
     Serial.println(y);
     Serial.println(F("  Then H from mid-travel."));
-  } else if (freeMax > blkMax + 8) {
-    Serial.println(F("  Verdict: classic polarity (free high) — unexpected on this unit"));
+  } else if (blkMax >= freeMax) {
+    Serial.println(F("  Verdict: BLOCK not lower — hold tip firmer, or free was still loaded"));
   } else {
-    Serial.println(F("  Verdict: weak contrast — hold tip firmer on BLOCK"));
+    Serial.println(F("  Verdict: weak contrast — rerun from true mid-travel"));
   }
 }
 
-// Poll SG while stepping.
-// Inverted polarity: arm on free (low SG), stall when SG >= y.
-// Abort if UART CRC fail rate is too high.
+// Classic StallGuard: arm on free (high SG), stall when SG <= y.
 bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stepper || maxSteps <= 0) {
     return false;
@@ -462,11 +493,10 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
 
   int32_t moved = 0;
   uint8_t chunkIdx = 0;
-  uint8_t highHits = 0;
+  uint8_t lowHits = 0;
   bool armed = false;
   bool stalled = false;
   uint16_t seenMax = 0;
-  uint16_t seenMin = 0xFFFF;
   uint16_t goodReads = 0;
   uint16_t badReads = 0;
   delay(150);
@@ -498,11 +528,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
         if (sg > seenMax) {
           seenMax = sg;
         }
-        if (sg < seenMin) {
-          seenMin = sg;
-        }
-        // Arm once we have seen free (low) SG
-        if (!armed && sg <= HOME_ARM_SG) {
+        if (!armed && sg >= HOME_ARM_SG) {
           armed = true;
         }
       }
@@ -539,19 +565,19 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
 
     if (chunkIdx < HOME_IGNORE_CHUNKS || !armed) {
       Serial.println(armed ? F(" (ignore)") : F(" (arming)"));
-      highHits = 0;
-    } else if (chunkGood > 0 && sgMaxChunk >= (uint16_t)sgThreshold) {
-      highHits++;
-      Serial.print(F(" high "));
-      Serial.print(highHits);
+      lowHits = 0;
+    } else if (chunkGood > 0 && sgMin <= (uint16_t)sgThreshold) {
+      lowHits++;
+      Serial.print(F(" low "));
+      Serial.print(lowHits);
       Serial.print(F("/"));
       Serial.println(HOME_STALL_HITS);
-      if (highHits >= HOME_STALL_HITS) {
+      if (lowHits >= HOME_STALL_HITS) {
         stalled = true;
         break;
       }
     } else {
-      highHits = 0;
+      lowHits = 0;
       Serial.println();
     }
 
@@ -559,11 +585,9 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   }
 
   if (!stalled && !armed) {
-    Serial.print(F("  never armed (sg min/max seen "));
-    Serial.print(seenMin == 0xFFFF ? 0 : seenMin);
-    Serial.print(F("/"));
+    Serial.print(F("  never armed (sg max seen "));
     Serial.print(seenMax);
-    Serial.println(F(") — need free (low) SG first; start mid-travel"));
+    Serial.println(F(") — need free (high) SG first; start mid-travel / check stealth"));
   }
 
   if (stalled) {
@@ -588,15 +612,15 @@ void homeBothEnds() {
   }
 
   Serial.println(F("StallGuard home (+retract / -extend)..."));
-  Serial.println(F("  Inverted SG: free=low, end=high. Stall when SG >= y."));
+  Serial.println(F("  Classic SG: free=high, end=low. Stall when SG <= y."));
   Serial.println(F("  Start mid-travel. Run d first to pick y."));
   applyStallGuardMode();
-  Serial.print(F("SG trip>="));
+  Serial.print(F("SGTHRS/y="));
   Serial.println(sgThreshold);
 
   Serial.println(F("Seeking RETRACTED (+) ..."));
   if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
-    Serial.println(F("RETRACT: no stall — try lower y / start mid-travel"));
+    Serial.println(F("RETRACT: no stall — try higher y / start mid-travel"));
     travelCalibrated = false;
     return;
   }
@@ -607,7 +631,7 @@ void homeBothEnds() {
 
   Serial.println(F("Seeking EXTENDED (-) ..."));
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
-    Serial.println(F("EXTEND: no stall — try lower y"));
+    Serial.println(F("EXTEND: no stall — try higher y"));
     travelCalibrated = false;
     return;
   }
@@ -620,7 +644,7 @@ void homeBothEnds() {
   Serial.println(travelMax);
 
   if (travelMax < HOME_MIN_TRAVEL) {
-    Serial.println(F("Travel too short — raise y (less sensitive), then H"));
+    Serial.println(F("Travel too short — lower y (less sensitive), then H"));
     travelCalibrated = false;
     return;
   }
@@ -663,7 +687,7 @@ void processCommand(String cmd) {
     const bool moving = stepper && stepper->isRunning();
     Serial.print(F("SG_RESULT="));
     Serial.print(readStallGuard());
-    Serial.print(F("  trip>="));
+    Serial.print(F("  SGTHRS="));
     Serial.print(sgThreshold);
     Serial.println(moving ? F("  (moving)") : F("  (idle — SG often ~0; sample while moving)"));
   } else if (c == 'y' || c == 'Y') {
@@ -673,9 +697,9 @@ void processCommand(String cmd) {
       if (uartReady) {
         driver.SGTHRS(sgThreshold);
       }
-      Serial.print(F("SG_TRIP>="));
+      Serial.print(F("SGTHRS="));
       Serial.print(sgThreshold);
-      Serial.println(F("  (software; stall when SG rises)"));
+      Serial.println(F("  (classic; stall when SG drops <= y)"));
     }
   } else if (c == 'g' || c == 'G') {
     int32_t dest = cmd.substring(1).toInt();
