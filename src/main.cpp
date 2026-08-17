@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v11";
+static const char *FW_VERSION = "tmc-stepper-uart-v13";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -150,21 +150,26 @@ void applyDriverDefaults() {
   driver.mstep_reg_select(true);
   driver.multistep_filt(true);
   driver.en_spreadCycle(false);  // stealthChop required for StallGuard4
-  driver.TPWMTHRS(0);            // stay in stealthChop at all speeds
+  // TMC2209: TPWMTHRS==0 disables stealthChop entirely (always spreadCycle).
+  // StealthChop is active when TSTEP >= TPWMTHRS — use a small non-zero value.
+  driver.TPWMTHRS(1);
   driver.rms_current(rmsMa);
   driver.microsteps(DEFAULT_MICROSTEPS);
   driver.toff(5);
-  // Same PWMCONF as working main soft-UART path (autoscale + autograd)
   driver.PWMCONF(0xC10D0024UL);
-  driver.TCOOLTHRS(0xFFFFF);  // StallGuard enabled for practical TSTEP values
+  // SG/CoolStep enabled when TSTEP < TCOOLTHRS; max = enable for all practical speeds
+  driver.TCOOLTHRS(0xFFFFF);
   driver.SGTHRS(sgThreshold);
+  driver.VACTUAL(0);
 
   driverConfigured = true;
   Serial.print(F("Done  rms="));
   Serial.print(rmsMa);
   Serial.print(F("mA  SGTHRS="));
   Serial.print(sgThreshold);
-  Serial.print(F("  spread="));
+  Serial.print(F("  TPWMTHRS="));
+  Serial.print(driver.TPWMTHRS());
+  Serial.print(F("  spreadCfg="));
   Serial.print(driver.en_spreadCycle() ? F("on") : F("off"));
   Serial.print(F("  stealth="));
   Serial.println(driver.stealth() ? F("yes") : F("no"));
@@ -220,10 +225,11 @@ uint16_t readStallGuard() {
 
 void applyStallGuardMode() {
   driver.en_spreadCycle(false);
-  driver.TPWMTHRS(0);
+  driver.TPWMTHRS(1);  // NOT 0 — 0 disables stealthChop on TMC2209
   driver.PWMCONF(0xC10D0024UL);
   driver.TCOOLTHRS(0xFFFFF);
   driver.SGTHRS(sgThreshold);
+  driver.VACTUAL(0);
 }
 
 // One SG sample with CRC labeling. Also optionally peek motion mode.
@@ -307,8 +313,8 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
   waitStepperIdle();
 }
 
-// Both measurement phases EXTEND (positive delta = tip moves out) so you can
-// load the shaft end with a finger. Retract between phases to make room.
+// Sample while EXTENDING only (same direction as serial '-' command).
+// No retract between phases — that pulled the tip away from your finger.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -320,33 +326,32 @@ void diagStallGuard() {
   }
 
   applyStallGuardMode();
-  Serial.println(F("d: FREE vs BLOCK (both phases EXTEND into the tip)"));
-  Serial.println(F("  Mid-travel. REAL = chip value. CRC_FAIL = UART trash."));
+  // Match serial cmds: '+' retract = negative move, '-' extend = positive move
+  const int32_t EXTEND = 500;
+  const int32_t RETRACT = -400;
+
+  Serial.println(F("d: FREE then BLOCK — both pushes EXTEND (tip out)"));
+  Serial.println(F("  REAL = chip value. CRC_FAIL = UART trash."));
 
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
-  // Make room so both phases can extend
-  Serial.println(F("  retract 500 (make room)..."));
-  stepper->move(-500);
+  Serial.println(F("  retract a bit (make room)..."));
+  stepper->move(RETRACT);
   waitStepperIdle();
   delay(150);
 
   uint16_t freeMax = 0, freeMin = 0xFFFF;
   uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- PHASE 1: FREE extend (do not touch) ---"), 600, 16, freeMax,
+  runSgPhase(F("--- PHASE 1: FREE extend (do not touch) ---"), EXTEND, 16, freeMax,
              freeMin, freeOk, freeFail);
 
-  Serial.println(F("  retract 500 (reset for block test)..."));
-  stepper->move(-500);
-  waitStepperIdle();
-
-  Serial.println(F("--- Put finger on the SHAFT TIP (extending end). 2s ---"));
+  Serial.println(F("--- Put finger on the TIP now. Extending into it in 2s ---"));
   delay(2000);
 
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- PHASE 2: BLOCKED extend (hold tip) ---"), 600, 16, blkMax,
+  runSgPhase(F("--- PHASE 2: BLOCKED extend (hold tip) ---"), EXTEND, 16, blkMax,
              blkMin, blkOk, blkFail);
 
   stepper->setSpeedInHz(moveSpeedHz);
