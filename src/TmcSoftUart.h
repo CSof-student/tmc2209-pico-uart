@@ -1,11 +1,11 @@
 /*
   Half-duplex soft UART Stream for TMC2209 on Pico.
-  Use with TMCStepper instead of Serial1 (Serial1 often hangs on single-wire).
+  Drop-in Stream for TMCStepper (Serial1 often hangs on single-wire Pico).
 
   Wiring:
     txPin --[1k]--+---- TMC UART
     rxPin --------+
-                  +--[1k..2.2k]-- 3.3V
+                  +--[1k..2.2k]-- 3.3V  (many modules already have a pull-up)
 */
 
 #pragma once
@@ -24,16 +24,20 @@ class TmcSoftUart : public Stream {
     }
     pinMode(_tx, INPUT);
     pinMode(_rx, INPUT_PULLUP);
+    _txHolding = false;
     _rxLen = 0;
     _rxIdx = 0;
   }
 
   void end() {
-    pinMode(_tx, INPUT);
+    releaseBus();
     pinMode(_rx, INPUT);
   }
 
-  int available() override { return (int)(_rxLen - _rxIdx); }
+  int available() override {
+    releaseBus();
+    return (int)(_rxLen - _rxIdx);
+  }
 
   int peek() override {
     if (_rxIdx >= _rxLen) {
@@ -43,25 +47,27 @@ class TmcSoftUart : public Stream {
   }
 
   int read() override {
+    releaseBus();  // must not drive TX while TMC replies
     if (_rxIdx >= _rxLen) {
-      // Blocking read with timeout — TMCStepper expects this after a write
-      if (!recvByte(_last, 50)) {
+      uint8_t b = 0;
+      if (!recvByte(b, 80)) {
         return -1;
       }
-      return _last;
+      return b;
     }
     return _buf[_rxIdx++];
   }
 
   void flush() override {
-    // no-op: never block (HardwareSerial.flush hung on this bus)
+    // Intentionally empty — HardwareSerial.flush() hung on this bus
   }
 
   size_t write(uint8_t b) override {
-    // New TX datagram: drop any unread RX
+    // New host TX: discard stale RX
     _rxLen = 0;
     _rxIdx = 0;
-    sendByte(b);
+    claimBus();
+    sendByte(b);  // leaves idle HIGH, still driving (until releaseBus)
     return 1;
   }
 
@@ -70,20 +76,35 @@ class TmcSoftUart : public Stream {
  private:
   uint8_t _tx;
   uint8_t _rx;
-  uint16_t _bitUs = 104;  // ~9600
+  uint16_t _bitUs = 104;
+  bool _txHolding = false;
   uint8_t _buf[16];
   uint8_t _rxLen = 0;
   uint8_t _rxIdx = 0;
-  uint8_t _last = 0;
 
   static inline void waitUntil(uint32_t deadline) {
     while ((int32_t)(time_us_32() - deadline) < 0) {
     }
   }
 
+  void claimBus() {
+    if (!_txHolding) {
+      pinMode(_tx, OUTPUT);
+      digitalWrite(_tx, HIGH);
+      _txHolding = true;
+      delayMicroseconds(20);
+    }
+  }
+
+  void releaseBus() {
+    if (_txHolding) {
+      pinMode(_tx, INPUT);  // high-Z; pull-up holds idle HIGH
+      _txHolding = false;
+    }
+  }
+
   void sendByte(uint8_t b) {
     noInterrupts();
-    pinMode(_tx, OUTPUT);
     digitalWrite(_tx, LOW);
     waitUntil(time_us_32() + _bitUs);
     for (uint8_t i = 0; i < 8; i++) {
@@ -91,9 +112,8 @@ class TmcSoftUart : public Stream {
       b >>= 1;
       waitUntil(time_us_32() + _bitUs);
     }
-    digitalWrite(_tx, HIGH);
+    digitalWrite(_tx, HIGH);  // stop / idle — keep driving until releaseBus()
     waitUntil(time_us_32() + _bitUs);
-    pinMode(_tx, INPUT);  // release bus for TMC reply
     interrupts();
   }
 

@@ -25,7 +25,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-hw-uart-v2";
+static const char *FW_VERSION = "tmc-hw-uart-v3";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -91,10 +91,21 @@ bool probeDriver() {
   if (!uartReady && !beginTmcUart()) {
     return false;
   }
-  const uint8_t ver = driver.version();
-  Serial.print(F("chip version=0x"));
-  Serial.println(ver, HEX);
-  return (ver == 0x21 || ver == 0x20);
+
+  // Try a few times — first datagram often trains autobaud
+  uint8_t ver = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    ver = driver.version();
+    Serial.print(F("  try "));
+    Serial.print(i + 1);
+    Serial.print(F(": 0x"));
+    Serial.println(ver, HEX);
+    if (ver == 0x21 || ver == 0x20) {
+      return true;
+    }
+    delay(20);
+  }
+  return false;
 }
 
 void applyDriverDefaults() {
