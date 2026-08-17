@@ -1,15 +1,21 @@
 /*
-  Pico + TMC2209 via hardware Serial1 + FastAccelStepper
+  Pico + TMC2209 + FastAccelStepper
 
-  Single-wire UART (module "UART" pin):
-    GP8 (TX) --[1k]--+---- TMC UART
-    GP9 (RX) --------+
-                     +--[1k..2.2k]-- 3.3V   (pull-up if idle not ~3.3V)
+  Uses TMCStepper with a half-duplex soft UART Stream (Serial1 hangs on this
+  single-wire bus on Pico). Call site stays simple:
 
-  STEP GP3, DIR GP2, EN->GND
-  VIO 3.3V, VM motor PSU, GND common
+    TmcSoftUart SerialTMC(8, 9);
+    TMC2209Stepper driver(&SerialTMC, R_SENSE, ADDR);
+    SerialTMC.begin(9600);
+    driver.begin();
 
-  Physical: + retracts, - extends. After H: pos 0 = retracted, travelMax = extended.
+  Wiring:
+    GP8 --[1k]--+---- TMC UART pin
+    GP9 --------+
+                +--[1k..2.2k]-- 3.3V
+    STEP GP3, DIR GP2, EN->GND, VIO 3.3V, VM motor PSU
+
+  Physical: + retracts, - extends. After H: 0 = retracted, travelMax = extended.
 */
 
 #include <Arduino.h>
@@ -17,26 +23,29 @@
 #include <task.h>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
+#include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-hw-uart-v1";
+static const char *FW_VERSION = "tmc-hw-uart-v2";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
 static const int8_t ENABLE_PIN = -1;
 
-static const uint8_t TMC_TX_PIN = 8;  // Pico TX -> TMC (via 1k)
-static const uint8_t TMC_RX_PIN = 9;  // Pico RX <- shared UART node
+static const uint8_t TMC_TX_PIN = 8;
+static const uint8_t TMC_RX_PIN = 9;
 static const float R_SENSE = 0.11f;
-static const uint8_t DRIVER_ADDRESS = 0b00;  // MS1/MS2 low
+static const uint8_t DRIVER_ADDRESS = 0b00;
+static const uint32_t TMC_BAUD = 9600;
 
 static const uint16_t DEFAULT_RMS_MA = 300;
 static const uint16_t DEFAULT_MICROSTEPS = 16;
 static const uint32_t DEFAULT_SPEED_HZ = 200;
 static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 200;
-static const uint32_t TMC_BAUD = 115200;
 
-TMC2209Stepper driver(&Serial1, R_SENSE, DRIVER_ADDRESS);
+TmcSoftUart SerialTMC(TMC_TX_PIN, TMC_RX_PIN);
+TMC2209Stepper driver(&SerialTMC, R_SENSE, DRIVER_ADDRESS);
+
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = nullptr;
 
@@ -68,32 +77,23 @@ bool beginTmcUart() {
   pinMode(TMC_RX_PIN, INPUT_PULLUP);
   delay(5);
   if (digitalRead(TMC_TX_PIN) == LOW) {
-    Serial.println(F("TX pin LOW — check wiring before Serial1.begin"));
+    Serial.println(F("TX pin LOW — check wiring"));
     return false;
   }
 
-  Serial1.setTX(TMC_TX_PIN);
-  Serial1.setRX(TMC_RX_PIN);
-  Serial1.begin(TMC_BAUD);
-  delay(50);
-
-  // Clear any junk / echo
-  while (Serial1.available()) {
-    Serial1.read();
-  }
-
+  SerialTMC.begin(TMC_BAUD);
   uartReady = true;
   return true;
 }
 
 bool probeDriver() {
+  Serial.println(F("t: probing..."));
   if (!uartReady && !beginTmcUart()) {
     return false;
   }
   const uint8_t ver = driver.version();
   Serial.print(F("chip version=0x"));
   Serial.println(ver, HEX);
-  // TMC2209 = 0x21, TMC2208 = 0x20
   return (ver == 0x21 || ver == 0x20);
 }
 
@@ -102,7 +102,7 @@ void applyDriverDefaults() {
     return;
   }
 
-  Serial.println(F("Applying TMC defaults (Serial1)..."));
+  Serial.println(F("Applying TMC defaults..."));
   driver.begin();
   driver.pdn_disable(true);
   driver.I_scale_analog(false);
@@ -111,8 +111,6 @@ void applyDriverDefaults() {
   driver.pwm_autoscale(true);
   driver.en_spreadCycle(false);
   driver.toff(5);
-
-  // StallGuard active across our move speeds
   driver.TCOOLTHRS(0xFFFFF);
   driver.SGTHRS(sgThreshold);
 
@@ -189,8 +187,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
-    const bool inIgnore = (chunkIdx < HOME_IGNORE_CHUNKS);
-    if (inIgnore) {
+    if (chunkIdx < HOME_IGNORE_CHUNKS) {
       Serial.println(F(" (ignore)"));
       lowHits = 0;
     } else if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
@@ -265,7 +262,7 @@ void homeBothEnds() {
   Serial.println(travelMax);
 
   if (travelMax < HOME_MIN_TRAVEL) {
-    Serial.println(F("Travel too short — usually false stall; lower y, then H"));
+    Serial.println(F("Travel too short — lower y, then H"));
     travelCalibrated = false;
     return;
   }
@@ -328,7 +325,6 @@ void processCommand(String cmd) {
     Serial.print(F("goto "));
     Serial.println(dest);
   } else if (c == '+' || c == '-') {
-    // + retracts (toward 0), - extends (toward travelMax)
     int32_t delta = (c == '+') ? -stepSize : stepSize;
     if (cmd.length() > 1) {
       int32_t mag = cmd.substring(1).toInt();
@@ -404,7 +400,7 @@ void setup() {
   Serial.print(F("=== FW "));
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
-  Serial.println(F("HW Serial1 @115200  GP8=TX GP9=RX  (1k on TX, shared UART pin)"));
+  Serial.println(F("TMCStepper + TmcSoftUart @9600 (Serial1 avoided — hangs on Pico half-duplex)"));
 
   if (ENABLE_PIN >= 0) {
     pinMode(ENABLE_PIN, OUTPUT);
