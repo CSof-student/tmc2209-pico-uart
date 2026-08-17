@@ -1,31 +1,32 @@
 /*
   Pico + TMC2209 + FastAccelStepper
 
-  Simple UART path: PIO SoftwareSerial (not Serial1 — that hangs on this
-  single-wire bus) + TMCStepper Stream API.
+  All register access goes through TMCStepper. The Stream under it is a
+  half-duplex soft UART that releases TX after each datagram (SoftwareSerial /
+  Serial1 keep TX driven and often get no TMC reply on this single-wire bus).
 
-    SoftwareSerial SerialTMC(RX, TX);
+    TmcSoftUart SerialTMC(8, 9);
     TMC2209Stepper driver(&SerialTMC, R_SENSE, ADDR);
     SerialTMC.begin(9600);
     driver.begin();
+    driver.version(); / rms_current() / SGTHRS() / SG_RESULT() / ...
 
   Wiring:
     GP8 --[1k]--+---- TMC UART pin
     GP9 --------+
-                +--[1k..2.2k]-- 3.3V
     STEP GP3, DIR GP2, EN->GND, VIO 3.3V, VM motor PSU
 
   Physical: + retracts, - extends. After H: 0 = retracted, travelMax = extended.
 */
 
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 #include <FreeRTOS.h>
 #include <task.h>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
+#include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-swserial-v1";
+static const char *FW_VERSION = "tmc-stepper-uart-v1";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -43,10 +44,7 @@ static const uint32_t DEFAULT_SPEED_HZ = 200;
 static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 200;
 
-// SoftwareSerial(rx, tx) — Pico core uses PIO under the hood.
-// Pass as Stream* so TMCStepper does NOT call .end() after every read
-// (that only happens on its internal SWSerial pin constructor path).
-SoftwareSerial SerialTMC(TMC_RX_PIN, TMC_TX_PIN);
+TmcSoftUart SerialTMC(TMC_TX_PIN, TMC_RX_PIN);
 TMC2209Stepper driver(&SerialTMC, R_SENSE, DRIVER_ADDRESS);
 
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -85,21 +83,45 @@ bool beginTmcUart() {
   }
 
   SerialTMC.begin(TMC_BAUD);
-  delay(10);
-  while (SerialTMC.available()) {
-    SerialTMC.read();
-  }
   uartReady = true;
   return true;
 }
 
+void loopbackCommand() {
+  Serial.println(F("b: loopback (TMC UART disconnected, jumper GP8-GP9)"));
+  if (SerialTMC.loopbackTest(0xA5)) {
+    Serial.println(F("b: OK (got 0xA5)"));
+  } else {
+    Serial.println(F("b: FAIL"));
+  }
+  // Restore port for TMCStepper
+  SerialTMC.begin(TMC_BAUD);
+  uartReady = true;
+}
+
 bool probeDriver() {
-  Serial.println(F("t: probing..."));
+  Serial.println(F("t: raw IOIN then TMCStepper.version()"));
   if (!uartReady && !beginTmcUart()) {
     return false;
   }
 
-  // Try a few times — first datagram often trains autobaud
+  uint8_t raw[16];
+  const uint8_t n = SerialTMC.rawIoinProbe(DRIVER_ADDRESS, raw, sizeof(raw));
+  Serial.print(F("  raw rx"));
+  Serial.print(n);
+  Serial.print(F(":"));
+  for (uint8_t i = 0; i < n; i++) {
+    Serial.print(F(" "));
+    Serial.print(raw[i], HEX);
+  }
+  if (n == 0) {
+    Serial.print(F(" (none)"));
+  }
+  Serial.println();
+
+  // Re-begin so TMCStepper datagram state is clean after raw probe
+  SerialTMC.begin(TMC_BAUD);
+
   uint8_t ver = 0;
   for (uint8_t i = 0; i < 5; i++) {
     ver = driver.version();
@@ -120,7 +142,7 @@ void applyDriverDefaults() {
     return;
   }
 
-  Serial.println(F("Applying TMC defaults..."));
+  Serial.println(F("Applying TMC defaults (TMCStepper)..."));
   driver.begin();
   driver.pdn_disable(true);
   driver.I_scale_analog(false);
@@ -141,7 +163,7 @@ void applyDriverDefaults() {
 
 void printHelp() {
   Serial.println(F("\nCommands:"));
-  Serial.println(F("  h/? help   v version   t UART probe   u apply defaults"));
+  Serial.println(F("  h/? help   v version   t UART probe   b loopback   u defaults"));
   Serial.println(F("  c <mA>  m <usteps>  i status"));
   Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
   Serial.println(F("  z SG read   y <0-255> SG thresh   H home ends"));
@@ -305,11 +327,13 @@ void processCommand(String cmd) {
   } else if (c == 'v' || c == 'V') {
     Serial.print(F("firmware="));
     Serial.println(FW_VERSION);
+  } else if (c == 'b' || c == 'B') {
+    loopbackCommand();
   } else if (c == 't' || c == 'T') {
     if (probeDriver()) {
       Serial.println(F("t: OK"));
     } else {
-      Serial.println(F("t: FAIL — check UART wiring / VM / VIO"));
+      Serial.println(F("t: FAIL — see raw rx line (want 05 FF 06 …)"));
     }
   } else if (c == 'u' || c == 'U') {
     applyDriverDefaults();
@@ -418,7 +442,7 @@ void setup() {
   Serial.print(F("=== FW "));
   Serial.print(FW_VERSION);
   Serial.println(F(" ==="));
-  Serial.println(F("TMCStepper + SoftwareSerial (PIO) @9600"));
+  Serial.println(F("TMCStepper registers + half-duplex Stream @9600"));
 
   if (ENABLE_PIN >= 0) {
     pinMode(ENABLE_PIN, OUTPUT);
