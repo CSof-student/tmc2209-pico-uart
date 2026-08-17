@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v18";
+static const char *FW_VERSION = "tmc-stepper-uart-v20";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -314,7 +314,7 @@ void printSgSample(const SgSample &s) {
   Serial.println();
 }
 
-// Poll SG while moving `delta` steps. Returns samples taken while isRunning.
+// Poll SG while moving `delta` steps.
 void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSamples,
                 uint16_t &outMax, uint16_t &outMin, uint8_t &outOk, uint8_t &outFail) {
   outMax = 0;
@@ -322,8 +322,6 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSampl
   outOk = 0;
   outFail = 0;
   Serial.println(name);
-  Serial.print(F("  move delta="));
-  Serial.println(delta);
 
   stepper->move(delta);
   delay(40);
@@ -349,17 +347,14 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSampl
     delay(8);
   }
   waitStepperIdle();
-  Serial.print(F("  phase done samples="));
-  Serial.print(outOk + outFail);
-  Serial.print(F(" sg="));
+  Serial.print(F("  → sg="));
   Serial.print(outMin == 0xFFFF ? 0 : outMin);
   Serial.print(F(".."));
   Serial.println(outMax);
 }
 
-// Your last log: FREE=0..2 (already jammed / not free), BLOCK spiked to 68
-// (those spikes are low-load / free moments — SG works). This test finds a
-// direction that shows high SG while free, then asks you to block that way.
+// Always push TIP OUT for free + block (same as serial '-', FAS positive).
+// Never pick tip-in for the block phase.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -378,77 +373,42 @@ void diagStallGuard() {
   driver.microsteps(8);
   applyStallGuardMode();
 
-  Serial.println(F("d: find free-SG direction, then block that way"));
-  Serial.println(F("  Start near MID-travel (not against an end)."));
+  // Same as serial: + → move(-) retract/tip IN; - → move(+) extend/tip OUT
+  const int32_t TIP_OUT = 1500;
+  const int32_t TIP_IN = -700;
+
+  Serial.println(F("d: FREE then BLOCK — both tip OUT (same as serial -)"));
+  Serial.println(F("  If tip moves IN during FREE, stop and say so."));
 
   stepper->setSpeedInHz(500);
   stepper->setAcceleration(700);
 
-  // Nudge both ways so we are not hard against one end
-  Serial.println(F("  settle: +400 then -400..."));
-  stepper->move(400);
-  waitStepperIdle();
-  stepper->move(-400);
+  Serial.println(F("  tip IN / retract (make room)..."));
+  stepper->move(TIP_IN);
   waitStepperIdle();
   delay(150);
 
-  uint16_t maxA = 0, minA = 0xFFFF;
-  uint8_t okA = 0, failA = 0;
-  runSgPhase(F("--- FREE A: FAS +1500 ---"), 1500, 50, maxA, minA, okA, failA);
+  uint16_t freeMax = 0, freeMin = 0xFFFF;
+  uint8_t freeOk = 0, freeFail = 0;
+  runSgPhase(F("--- FREE: tip OUT (do not touch) ---"), TIP_OUT, 50, freeMax, freeMin,
+             freeOk, freeFail);
 
-  delay(100);
-
-  uint16_t maxB = 0, minB = 0xFFFF;
-  uint8_t okB = 0, failB = 0;
-  runSgPhase(F("--- FREE B: FAS -1500 ---"), -1500, 50, maxB, minB, okB, failB);
-
-  const bool aGood = (okA >= 5 && maxA >= 20);
-  const bool bGood = (okB >= 5 && maxB >= 20);
-  int32_t blockDir = 0;
-  uint16_t freeMax = 0;
-  uint16_t freeMin = 0xFFFF;
-
-  Serial.println(F("=== FREE COMPARE ==="));
-  Serial.print(F("  A(+): sg="));
-  Serial.print(minA == 0xFFFF ? 0 : minA);
-  Serial.print(F(".."));
-  Serial.println(maxA);
-  Serial.print(F("  B(-): sg="));
-  Serial.print(minB == 0xFFFF ? 0 : minB);
-  Serial.print(F(".."));
-  Serial.println(maxB);
-
-  if (aGood && (!bGood || maxA >= maxB)) {
-    blockDir = 1500;
-    freeMax = maxA;
-    freeMin = minA;
-    Serial.println(F("  Using direction A (+) for block test"));
-  } else if (bGood) {
-    blockDir = -1500;
-    freeMax = maxB;
-    freeMin = minB;
-    Serial.println(F("  Using direction B (-) for block test"));
-  } else {
-    Serial.println(F("  Neither direction showed free SG>=20."));
-    Serial.println(F("  Move to mid-travel with +/- manually, ensure tip can move both ways, rerun d."));
-    driver.microsteps(DEFAULT_MICROSTEPS);
-    driver.rms_current(oldMa);
-    stepper->setSpeedInHz(moveSpeedHz);
-    stepper->setAcceleration(moveAccel);
-    return;
+  if (freeMax < 15) {
+    Serial.println(F("  Free SG still low — likely already near extend end."));
+    Serial.println(F("  Manually retract (+) toward mid, then d again."));
   }
 
-  // Back off opposite to blockDir so there is room to push into the finger
-  Serial.println(F("  backoff opposite way..."));
-  stepper->move(-blockDir / 2);
+  Serial.println(F("  tip IN a bit (room to push into finger)..."));
+  stepper->move(TIP_IN);
   waitStepperIdle();
 
-  Serial.println(F("--- Put finger on TIP to resist THIS next move. 2s ---"));
+  Serial.println(F("--- Finger on TIP. Next move pushes OUT into finger. 2s ---"));
   delay(2000);
 
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- BLOCKED ---"), blockDir, 50, blkMax, blkMin, blkOk, blkFail);
+  runSgPhase(F("--- BLOCK: tip OUT (hold tip) ---"), TIP_OUT, 50, blkMax, blkMin, blkOk,
+             blkFail);
 
   driver.microsteps(DEFAULT_MICROSTEPS);
   driver.rms_current(oldMa);
@@ -466,16 +426,18 @@ void diagStallGuard() {
   Serial.print(F(".."));
   Serial.println(blkMax);
 
-  if (freeMax > blkMax + 8 && blkMax < freeMax / 2) {
+  if (freeOk < 5) {
+    Serial.println(F("  Verdict: too few samples"));
+  } else if (freeMax < 15) {
+    Serial.println(F("  Verdict: free SG too low — start more retracted, rerun d"));
+  } else if (freeMax > blkMax + 8) {
     const int y = (int)((blkMax + freeMin) / 2);
     Serial.print(F("  Verdict: SG responds — try y "));
     Serial.println(y > 2 ? y : 3);
-    Serial.print(F("  Home seek dir for this tip-out was FAS "));
-    Serial.println(blockDir > 0 ? F("+") : F("-"));
   } else if (blkMax >= freeMax) {
-    Serial.println(F("  Verdict: BLOCK SG >= FREE — finger likely not holding, or still hitting an end"));
+    Serial.println(F("  Verdict: BLOCK not lower than FREE — hold tip firmer / check tip really OUT"));
   } else {
-    Serial.println(F("  Verdict: weak contrast — try again from true mid-travel"));
+    Serial.println(F("  Verdict: weak contrast"));
   }
 }
 
