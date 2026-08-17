@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v6";
+static const char *FW_VERSION = "tmc-stepper-uart-v7";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -61,12 +61,12 @@ bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
 
-static const int32_t HOME_BACKOFF = 48;
-static const int32_t HOME_CHUNK = 40;
+static const int32_t HOME_BACKOFF = 80;
+static const int32_t HOME_CHUNK = 60;
 static const int32_t HOME_MAX_TRAVEL = 20000;
 static const int32_t HOME_MIN_TRAVEL = 200;
-static const uint8_t HOME_IGNORE_CHUNKS = 4;
-static const uint8_t HOME_STALL_HITS = 2;
+static const uint8_t HOME_IGNORE_CHUNKS = 8;
+static const uint8_t HOME_STALL_HITS = 3;
 static const uint32_t HOME_SPEED_HZ = 500;
 static const uint32_t HOME_ACCEL = 800;
 
@@ -217,8 +217,16 @@ uint16_t readStallGuard() {
   return 0xFFFF;
 }
 
-// Live StallGuard tune: one SG read per sample (retries inside readStallGuard).
-// Good lines look like sg=8..12 while free; CRC gaps used to print fake sg=0.
+void applyStallGuardMode() {
+  driver.en_spreadCycle(false);
+  driver.TPWMTHRS(0);
+  driver.PWMCONF(0xC10D0024UL);
+  driver.TCOOLTHRS(0xFFFFF);
+  driver.SGTHRS(sgThreshold);
+}
+
+// Live StallGuard tune. Backs off first — after a failed H you are often
+// jammed at an end (SG stays 0..2). Free travel should show sg ~8..12.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -229,32 +237,30 @@ void diagStallGuard() {
     return;
   }
 
-  driver.TCOOLTHRS(0xFFFFF);
-  driver.TPWMTHRS(0);
-  driver.en_spreadCycle(false);
-  driver.SGTHRS(sgThreshold);
+  applyStallGuardMode();
 
-  Serial.println(F("d: move + poll SG only (CRC retries on)"));
+  Serial.println(F("d: backoff then poll SG in free travel"));
   Serial.print(F("  SGTHRS="));
-  Serial.print(sgThreshold);
-  Serial.print(F("  stealth="));
-  Serial.print(driver.stealth() ? F("1") : F("0"));
-  Serial.print(F("  spreadIO="));
-  Serial.println(driver.spread_en() ? F("1") : F("0"));
-
-  const uint32_t tstepOnce = driver.TSTEP();
-  Serial.print(F("  tstep(idle-ish)="));
-  Serial.println(tstepOnce);
+  Serial.println(sgThreshold);
 
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
-  stepper->move(-800);
+
+  // Clear a jam from a failed home (cmd '+'/retract = negative move)
+  Serial.println(F("  backoff retract 400..."));
+  stepper->move(-400);
+  waitStepperIdle();
+  delay(100);
+
+  Serial.println(F("  sampling while extending..."));
+  stepper->move(900);
 
   uint8_t n = 0;
   uint8_t ok = 0;
   uint8_t fail = 0;
   uint16_t sgMax = 0;
-  while (stepper->isRunning() && n < 30) {
+  uint16_t sgMinOk = 0xFFFF;
+  while (stepper->isRunning() && n < 35) {
     const uint16_t sg = readStallGuard();
     Serial.print(F("  sg="));
     if (sg == 0xFFFF) {
@@ -266,6 +272,9 @@ void diagStallGuard() {
       if (sg > sgMax) {
         sgMax = sg;
       }
+      if (sg < sgMinOk) {
+        sgMinOk = sg;
+      }
     }
     n++;
     delay(40);
@@ -273,29 +282,41 @@ void diagStallGuard() {
   waitStepperIdle();
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
+
   Serial.print(F("d: done  ok="));
   Serial.print(ok);
   Serial.print(F(" fail="));
   Serial.print(fail);
   Serial.print(F(" sgMax="));
-  Serial.println(sgMax);
-  Serial.println(F("  Set y a bit under sgMax (e.g. sgMax 12 → y 6), then H"));
+  Serial.print(sgMax);
+  Serial.print(F(" sgMin="));
+  Serial.println(sgMinOk == 0xFFFF ? 0 : sgMinOk);
+  if (sgMax < 5) {
+    Serial.println(F("  sgMax still low — manually +/- to mid-travel (unjam), then d again"));
+  } else {
+    Serial.print(F("  Try: y "));
+    Serial.print(sgMax >= 4 ? (sgMax / 2) : 2);
+    Serial.println(F("   then H"));
+  }
 }
 
-// Poll SG_RESULT while stepping. StallGuard is invalid when standing still
-// (idle reads often 0..2) — that was why mid-test looked stuck low.
+// Poll SG while stepping. Stall detect is ARMED only after we see free SG
+// above threshold — avoids false home when jammed or UART returns 0s.
 bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stepper || maxSteps <= 0) {
     return false;
   }
 
+  applyStallGuardMode();
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
   int32_t moved = 0;
   uint8_t chunkIdx = 0;
   uint8_t lowHits = 0;
+  bool armed = false;
   bool stalled = false;
+  uint16_t seenMax = 0;
   delay(150);
 
   while (moved < maxSteps) {
@@ -305,10 +326,22 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     stepper->move((int32_t)dirSign * chunk);
 
     uint16_t sgMin = 0xFFFF;
+    uint16_t sgMaxChunk = 0;
     while (stepper->isRunning()) {
       const uint16_t sg = readStallGuard();
-      if (sg != 0xFFFF && sg < sgMin) {
-        sgMin = sg;
+      if (sg != 0xFFFF) {
+        if (sg < sgMin) {
+          sgMin = sg;
+        }
+        if (sg > sgMaxChunk) {
+          sgMaxChunk = sg;
+        }
+        if (sg > seenMax) {
+          seenMax = sg;
+        }
+        if (!armed && sg > (uint16_t)sgThreshold) {
+          armed = true;
+        }
       }
       delay(12);
     }
@@ -316,17 +349,21 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     const int32_t stepped = abs(stepper->getCurrentPosition() - pos0);
     moved += (stepped > 0) ? stepped : chunk;
 
-    Serial.print(F("  sgMin="));
+    Serial.print(F("  sg="));
     if (sgMin == 0xFFFF) {
       Serial.print(F("crcFail"));
     } else {
       Serial.print(sgMin);
+      Serial.print(F(".."));
+      Serial.print(sgMaxChunk);
     }
+    Serial.print(F(" maxSeen="));
+    Serial.print(seenMax);
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
-    if (chunkIdx < HOME_IGNORE_CHUNKS) {
-      Serial.println(F(" (ignore)"));
+    if (chunkIdx < HOME_IGNORE_CHUNKS || !armed) {
+      Serial.println(armed ? F(" (ignore)") : F(" (arming — need free SG > y)"));
       lowHits = 0;
     } else if (sgMin != 0xFFFF && sgMin <= (uint16_t)sgThreshold) {
       lowHits++;
@@ -344,6 +381,12 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     }
 
     chunkIdx++;
+  }
+
+  if (!stalled && !armed) {
+    Serial.print(F("  never armed (sg max seen "));
+    Serial.print(seenMax);
+    Serial.println(F(") — unjam mid-travel, raise current/speed, or lower y"));
   }
 
   if (stalled) {
@@ -368,8 +411,8 @@ void homeBothEnds() {
   }
 
   Serial.println(F("StallGuard home (+retract / -extend)..."));
-  driver.TCOOLTHRS(0xFFFFF);
-  driver.SGTHRS(sgThreshold);
+  Serial.println(F("  Tip: start near mid-travel (not jammed). Run d first; need sgMax > y."));
+  applyStallGuardMode();
   Serial.print(F("SGTHRS="));
   Serial.println(sgThreshold);
 
