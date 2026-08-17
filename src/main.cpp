@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v15";
+static const char *FW_VERSION = "tmc-stepper-uart-v16";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -239,63 +239,92 @@ void applyStallGuardMode() {
   delay(100);
 }
 
-// One SG sample with CRC labeling. Also optionally peek motion mode.
+// One SG sample with CRC labeling + motion context.
 struct SgSample {
-  uint16_t sg;      // 0xFFFF = CRC fail
+  uint16_t sg;  // 0xFFFF = CRC fail
   uint32_t tstep;
+  uint32_t sgRaw;
+  uint8_t pwmScale;
   bool stealth;
   bool spread;
+  bool ola;
+  bool olb;
 };
 
 SgSample sampleSgDetailed() {
   SgSample s{};
-  s.sg = readStallGuard();
-  // Extra regs only when SG read worked — avoids hammering UART on failure storms
-  if (s.sg != 0xFFFF) {
+  s.sg = 0xFFFF;
+  s.tstep = 0xFFFFFFFFUL;
+  s.sgRaw = 0;
+  s.pwmScale = 0;
+  s.stealth = false;
+  s.spread = false;
+  s.ola = false;
+  s.olb = false;
+
+  for (uint8_t attempt = 0; attempt < 6; attempt++) {
     driver.CRCerror = false;
-    s.tstep = driver.TSTEP();
-    if (driver.CRCerror) {
-      s.tstep = 0xFFFFFFFFUL;
+    s.sgRaw = driver.SG_RESULT();
+    if (!driver.CRCerror) {
+      s.sg = (uint16_t)(s.sgRaw & 0x3FF);
+      break;
     }
-    s.stealth = driver.stealth();
-    s.spread = driver.spread_en();
+    delay(3);
   }
+  if (s.sg == 0xFFFF) {
+    return s;
+  }
+
+  driver.CRCerror = false;
+  s.tstep = driver.TSTEP();
+  if (driver.CRCerror) {
+    s.tstep = 0xFFFFFFFFUL;
+  }
+  s.stealth = driver.stealth();
+  s.spread = driver.spread_en();
+  s.ola = driver.ola();
+  s.olb = driver.olb();
+  s.pwmScale = driver.pwm_scale_sum();
   return s;
 }
 
 void printSgSample(const SgSample &s) {
   Serial.print(F("  "));
   if (s.sg == 0xFFFF) {
-    Serial.print(F("SG=CRC_FAIL"));
+    Serial.println(F("SG=CRC_FAIL"));
+    return;
+  }
+  Serial.print(F("SG="));
+  Serial.print(s.sg);
+  Serial.print(F(" raw=0x"));
+  Serial.print(s.sgRaw, HEX);
+  Serial.print(F(" tstep="));
+  if (s.tstep == 0xFFFFFFFFUL) {
+    Serial.print(F("?"));
   } else {
-    Serial.print(F("SG="));
-    Serial.print(s.sg);
-    Serial.print(F("  REAL"));  // CRC passed — this is what the chip returned
+    Serial.print(s.tstep);
   }
-  if (s.sg != 0xFFFF) {
-    Serial.print(F("  tstep="));
-    if (s.tstep == 0xFFFFFFFFUL) {
-      Serial.print(F("?"));
-    } else {
-      Serial.print(s.tstep);
-    }
-    Serial.print(F("  stealth="));
-    Serial.print(s.stealth ? 1 : 0);
-    Serial.print(F("  spreadIO="));
-    Serial.print(s.spread ? 1 : 0);
-  }
+  Serial.print(F(" stealth="));
+  Serial.print(s.stealth ? 1 : 0);
+  Serial.print(F(" pwmScale="));
+  Serial.print(s.pwmScale);
+  Serial.print(F(" ol="));
+  Serial.print(s.ola ? 1 : 0);
+  Serial.print(s.olb ? 1 : 0);
   Serial.println();
 }
 
 void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
-                uint16_t &outMax, uint16_t &outMin, uint8_t &outOk, uint8_t &outFail) {
+                uint16_t &outMax, uint16_t &outMin, uint8_t &outOk, uint8_t &outFail,
+                uint32_t &outTstepMin) {
   outMax = 0;
   outMin = 0xFFFF;
   outOk = 0;
   outFail = 0;
+  outTstepMin = 0xFFFFFFFFUL;
   Serial.println(name);
   stepper->move(delta);
-  delay(80);
+  delay(100);
   uint8_t n = 0;
   while (n < samples) {
     if (!stepper->isRunning() && n > 3) {
@@ -313,17 +342,17 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
       if (s.sg < outMin) {
         outMin = s.sg;
       }
+      if (s.tstep != 0xFFFFFFFFUL && s.tstep < outTstepMin) {
+        outTstepMin = s.tstep;
+      }
     }
     n++;
-    delay(50);
+    delay(40);
   }
   waitStepperIdle();
 }
 
-// Sample while pushing the TIP OUT into your finger.
-// Empirically on this wiring, FAS positive move pulls the tip away — so
-// tip-out uses negative deltas (same as serial '+' / retract command mapping
-// was inverted relative to "extend into finger" for this actuator end).
+// Tip-out = negative FAS delta on this wiring. High speed + coarse µsteps for SG.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -335,64 +364,86 @@ void diagStallGuard() {
   }
 
   applyStallGuardMode();
-  // Tip OUT (into finger) / tip IN (make room) — flipped from FAS +/= geometry
-  const int32_t TIP_OUT = -500;
-  const int32_t TIP_IN = 400;
 
-  Serial.println(F("d: FREE then BLOCK — tip OUT into finger (dir flipped for your wiring)"));
-  Serial.println(F("  REAL = chip value. CRC_FAIL = UART trash."));
+  const int32_t TIP_OUT = -800;
+  const int32_t TIP_IN = 500;
+  const uint16_t oldMs = DEFAULT_MICROSTEPS;
+  const uint16_t oldMa = rmsMa;
+  const uint32_t oldSpd = moveSpeedHz;
 
-  stepper->setSpeedInHz(HOME_SPEED_HZ);
-  stepper->setAcceleration(HOME_ACCEL);
+  // Datasheet: very low speed → SG unstable / sticks near 0. Push harder for this test.
+  driver.microsteps(4);
+  if (rmsMa < 450) {
+    driver.rms_current(450);
+  }
+  applyStallGuardMode();
+
+  Serial.println(F("d: FREE/BLOCK at 4µstep / >=450mA / 1200Hz (SG needs speed)"));
+  Serial.print(F("  IRUN CS path active, toff="));
+  Serial.println(driver.toff());
+
+  stepper->setSpeedInHz(1200);
+  stepper->setAcceleration(1500);
 
   Serial.println(F("  tip IN (make room)..."));
   stepper->move(TIP_IN);
   waitStepperIdle();
-  delay(150);
+  delay(200);  // standstill stealth regulate
 
   uint16_t freeMax = 0, freeMin = 0xFFFF;
   uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- PHASE 1: FREE tip-out (do not touch) ---"), TIP_OUT, 16, freeMax,
-             freeMin, freeOk, freeFail);
+  uint32_t freeTstep = 0xFFFFFFFFUL;
+  runSgPhase(F("--- PHASE 1: FREE tip-out ---"), TIP_OUT, 20, freeMax, freeMin, freeOk,
+             freeFail, freeTstep);
 
-  Serial.println(F("--- Put finger on the TIP now. Pushing OUT into it in 2s ---"));
+  Serial.println(F("--- Finger on TIP. Pushing OUT in 2s ---"));
   delay(2000);
 
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- PHASE 2: BLOCKED tip-out (hold tip) ---"), TIP_OUT, 16, blkMax,
-             blkMin, blkOk, blkFail);
+  uint32_t blkTstep = 0xFFFFFFFFUL;
+  runSgPhase(F("--- PHASE 2: BLOCKED tip-out ---"), TIP_OUT, 20, blkMax, blkMin, blkOk,
+             blkFail, blkTstep);
 
-  stepper->setSpeedInHz(moveSpeedHz);
+  // restore
+  driver.microsteps(oldMs);
+  driver.rms_current(oldMa);
+  stepper->setSpeedInHz(oldSpd > 0 ? oldSpd : DEFAULT_SPEED_HZ);
   stepper->setAcceleration(moveAccel);
+  applyStallGuardMode();
 
   Serial.println(F("=== SUMMARY ==="));
-  Serial.print(F("  FREE  ok/fail="));
-  Serial.print(freeOk);
-  Serial.print(F("/"));
-  Serial.print(freeFail);
-  Serial.print(F("  sg="));
+  Serial.print(F("  FREE  sg="));
   Serial.print(freeMin == 0xFFFF ? 0 : freeMin);
   Serial.print(F(".."));
-  Serial.println(freeMax);
-  Serial.print(F("  BLOCK ok/fail="));
-  Serial.print(blkOk);
+  Serial.print(freeMax);
+  Serial.print(F("  tstepMin="));
+  Serial.print(freeTstep == 0xFFFFFFFFUL ? 0 : freeTstep);
+  Serial.print(F("  ok/fail="));
+  Serial.print(freeOk);
   Serial.print(F("/"));
-  Serial.print(blkFail);
-  Serial.print(F("  sg="));
+  Serial.println(freeFail);
+  Serial.print(F("  BLOCK sg="));
   Serial.print(blkMin == 0xFFFF ? 0 : blkMin);
   Serial.print(F(".."));
-  Serial.println(blkMax);
+  Serial.print(blkMax);
+  Serial.print(F("  tstepMin="));
+  Serial.println(blkTstep == 0xFFFFFFFFUL ? 0 : blkTstep);
 
-  if (freeOk < 3 || blkOk < 3) {
-    Serial.println(F("  Verdict: UART too unreliable while moving — fix reads first"));
+  const bool tstepStandstill =
+      (freeTstep >= 1000000UL) || (freeTstep == 0xFFFFFFFFUL);
+  if (freeOk < 3) {
+    Serial.println(F("  Verdict: UART failing — cannot trust SG"));
+  } else if (tstepStandstill) {
+    Serial.println(F("  Verdict: tstep~standstill while commanding move — STEP not reaching TMC"));
   } else if (freeMax <= 2 && blkMax <= 2) {
-    Serial.println(F("  Verdict: SG stuck ~0 even when free — StallGuard not active/measuring"));
-    Serial.println(F("    Check stealth=1, tstep not 1048575 while moving, spreadIO=0"));
+    Serial.println(F("  Verdict: stealth on + motion seen, but SG_RESULT stuck 0"));
+    Serial.println(F("    → StallGuard4 not producing load values (motor/speed/current/back-EMF)"));
+    Serial.println(F("    Check ol= flags (open load). Try c 600, then u, then d again."));
   } else if (freeMax > blkMax + 2) {
-    Serial.println(F("  Verdict: SG responds to load — use y between blockMax and freeMin"));
+    Serial.println(F("  Verdict: SG responds to load — usable"));
   } else {
-    Serial.println(F("  Verdict: FREE and BLOCK look the same — weak/noisy SG, not usable yet"));
+    Serial.println(F("  Verdict: FREE≈BLOCK — weak SG contrast"));
   }
 }
 
