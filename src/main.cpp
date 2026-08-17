@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v20";
+static const char *FW_VERSION = "tmc-stepper-uart-v21";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -353,8 +353,8 @@ void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t maxSampl
   Serial.println(outMax);
 }
 
-// Always push TIP OUT for free + block (same as serial '-', FAS positive).
-// Never pick tip-in for the block phase.
+// Always push TIP OUT for free + block.
+// Absolute FAS (matches H): +1 = retract/tip IN, -1 = extend/tip OUT.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -373,42 +373,44 @@ void diagStallGuard() {
   driver.microsteps(8);
   applyStallGuardMode();
 
-  // Same as serial: + → move(-) retract/tip IN; - → move(+) extend/tip OUT
-  const int32_t TIP_OUT = 1500;
-  const int32_t TIP_IN = -700;
+  // Absolute FAS: same as H. Empirically + = tip IN, - = tip OUT.
+  const int32_t TIP_OUT = -1500;
+  const int32_t TIP_IN = 700;
 
-  Serial.println(F("d: FREE then BLOCK — both tip OUT (same as serial -)"));
-  Serial.println(F("  If tip moves IN during FREE, stop and say so."));
+  Serial.println(F("d: FREE + BLOCK both tip OUT (FAS -)"));
+  Serial.println(F("  Watch '>>> tip OUT' — tip must push outward."));
 
   stepper->setSpeedInHz(500);
   stepper->setAcceleration(700);
 
-  Serial.println(F("  tip IN / retract (make room)..."));
+  Serial.println(F("  (prep) tip IN..."));
   stepper->move(TIP_IN);
   waitStepperIdle();
-  delay(150);
+  delay(200);
+
+  Serial.println(F(">>> tip OUT now — FREE (do not touch)"));
+  delay(500);
 
   uint16_t freeMax = 0, freeMin = 0xFFFF;
   uint8_t freeOk = 0, freeFail = 0;
-  runSgPhase(F("--- FREE: tip OUT (do not touch) ---"), TIP_OUT, 50, freeMax, freeMin,
-             freeOk, freeFail);
+  runSgPhase(F("--- FREE ---"), TIP_OUT, 50, freeMax, freeMin, freeOk, freeFail);
 
   if (freeMax < 15) {
     Serial.println(F("  Free SG still low — likely already near extend end."));
-    Serial.println(F("  Manually retract (+) toward mid, then d again."));
+    Serial.println(F("  Manually retract toward mid, then d again."));
   }
 
-  Serial.println(F("  tip IN a bit (room to push into finger)..."));
+  Serial.println(F("  (prep) tip IN..."));
   stepper->move(TIP_IN);
   waitStepperIdle();
 
-  Serial.println(F("--- Finger on TIP. Next move pushes OUT into finger. 2s ---"));
+  Serial.println(F("--- Finger on TIP. 2s, then tip OUT into finger ---"));
   delay(2000);
 
+  Serial.println(F(">>> tip OUT now — BLOCK (hold tip)"));
   uint16_t blkMax = 0, blkMin = 0xFFFF;
   uint8_t blkOk = 0, blkFail = 0;
-  runSgPhase(F("--- BLOCK: tip OUT (hold tip) ---"), TIP_OUT, 50, blkMax, blkMin, blkOk,
-             blkFail);
+  runSgPhase(F("--- BLOCK ---"), TIP_OUT, 50, blkMax, blkMin, blkOk, blkFail);
 
   driver.microsteps(DEFAULT_MICROSTEPS);
   driver.rms_current(oldMa);
