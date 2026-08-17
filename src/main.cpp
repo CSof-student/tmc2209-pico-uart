@@ -26,7 +26,7 @@
 #include <FastAccelStepper.h>
 #include "TmcSoftUart.h"
 
-static const char *FW_VERSION = "tmc-stepper-uart-v7";
+static const char *FW_VERSION = "tmc-stepper-uart-v10";
 
 static const uint8_t STEP_PIN = 3;
 static const uint8_t DIR_PIN = 2;
@@ -56,7 +56,7 @@ bool uartReady = false;
 bool driverConfigured = false;
 String line;
 
-uint8_t sgThreshold = 6;  // free SG on this motor tops ~10–12; keep thresh below that
+uint8_t sgThreshold = 5;  // must be BELOW free sgMax (~12). y 20 can never trip on this motor.
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
@@ -67,8 +67,9 @@ static const int32_t HOME_MAX_TRAVEL = 20000;
 static const int32_t HOME_MIN_TRAVEL = 200;
 static const uint8_t HOME_IGNORE_CHUNKS = 8;
 static const uint8_t HOME_STALL_HITS = 3;
-static const uint32_t HOME_SPEED_HZ = 500;
-static const uint32_t HOME_ACCEL = 800;
+static const uint16_t HOME_ARM_SG = 6;  // free motion on this setup reaches ~8..12
+static const uint32_t HOME_SPEED_HZ = 400;  // slower = cleaner soft-UART SG reads
+static const uint32_t HOME_ACCEL = 600;
 
 uint32_t moveSpeedHz = DEFAULT_SPEED_HZ;
 int32_t moveAccel = DEFAULT_ACCEL;
@@ -174,7 +175,7 @@ void printHelp() {
   Serial.println(F("  h/? help   v version   t UART probe   b loopback   u defaults"));
   Serial.println(F("  c <mA>  m <usteps>  i status"));
   Serial.println(F("  +/- nudge (+retract -extend)  n size  s Hz  a accel  g <pos>  x stop"));
-  Serial.println(F("  z SG read   y <0-255> SG thresh   d SG diag move   H home ends"));
+  Serial.println(F("  z SG read   y <0-255> SG thresh   d FREE vs BLOCK SG test   H home"));
 }
 
 void printMotionStatus() {
@@ -205,14 +206,14 @@ uint16_t readStallGuard() {
   if (!uartReady) {
     return 0xFFFF;
   }
-  // Soft UART drops CRCs while STEP is noisy — retry before treating as 0.
-  for (uint8_t attempt = 0; attempt < 4; attempt++) {
+  // Soft UART drops CRCs while STEP is noisy — retry before treating as fail.
+  for (uint8_t attempt = 0; attempt < 8; attempt++) {
     driver.CRCerror = false;
     const uint16_t v = (uint16_t)(driver.SG_RESULT() & 0x3FF);
     if (!driver.CRCerror) {
       return v;
     }
-    delay(2);
+    delay(3);
   }
   return 0xFFFF;
 }
@@ -225,8 +226,90 @@ void applyStallGuardMode() {
   driver.SGTHRS(sgThreshold);
 }
 
-// Live StallGuard tune. Backs off first — after a failed H you are often
-// jammed at an end (SG stays 0..2). Free travel should show sg ~8..12.
+// One SG sample with CRC labeling. Also optionally peek motion mode.
+struct SgSample {
+  uint16_t sg;      // 0xFFFF = CRC fail
+  uint32_t tstep;
+  bool stealth;
+  bool spread;
+};
+
+SgSample sampleSgDetailed() {
+  SgSample s{};
+  s.sg = readStallGuard();
+  // Extra regs only when SG read worked — avoids hammering UART on failure storms
+  if (s.sg != 0xFFFF) {
+    driver.CRCerror = false;
+    s.tstep = driver.TSTEP();
+    if (driver.CRCerror) {
+      s.tstep = 0xFFFFFFFFUL;
+    }
+    s.stealth = driver.stealth();
+    s.spread = driver.spread_en();
+  }
+  return s;
+}
+
+void printSgSample(const SgSample &s) {
+  Serial.print(F("  "));
+  if (s.sg == 0xFFFF) {
+    Serial.print(F("SG=CRC_FAIL"));
+  } else {
+    Serial.print(F("SG="));
+    Serial.print(s.sg);
+    Serial.print(F("  REAL"));  // CRC passed — this is what the chip returned
+  }
+  if (s.sg != 0xFFFF) {
+    Serial.print(F("  tstep="));
+    if (s.tstep == 0xFFFFFFFFUL) {
+      Serial.print(F("?"));
+    } else {
+      Serial.print(s.tstep);
+    }
+    Serial.print(F("  stealth="));
+    Serial.print(s.stealth ? 1 : 0);
+    Serial.print(F("  spreadIO="));
+    Serial.print(s.spread ? 1 : 0);
+  }
+  Serial.println();
+}
+
+void runSgPhase(const __FlashStringHelper *name, int32_t delta, uint8_t samples,
+                uint16_t &outMax, uint16_t &outMin, uint8_t &outOk, uint8_t &outFail) {
+  outMax = 0;
+  outMin = 0xFFFF;
+  outOk = 0;
+  outFail = 0;
+  Serial.println(name);
+  stepper->move(delta);
+  delay(80);
+  uint8_t n = 0;
+  while (n < samples) {
+    if (!stepper->isRunning() && n > 3) {
+      break;
+    }
+    const SgSample s = sampleSgDetailed();
+    printSgSample(s);
+    if (s.sg == 0xFFFF) {
+      outFail++;
+    } else {
+      outOk++;
+      if (s.sg > outMax) {
+        outMax = s.sg;
+      }
+      if (s.sg < outMin) {
+        outMin = s.sg;
+      }
+    }
+    n++;
+    delay(50);
+  }
+  waitStepperIdle();
+}
+
+// Two-phase test: FREE travel, then BLOCK with finger.
+// If both phases show REAL SG≈0, StallGuard is not measuring (config/mode).
+// If FREE is higher and BLOCK drops, SG works — tune y from that gap.
 void diagStallGuard() {
   if (!stepper) {
     Serial.println(F("no stepper"));
@@ -238,70 +321,60 @@ void diagStallGuard() {
   }
 
   applyStallGuardMode();
-
-  Serial.println(F("d: backoff then poll SG in free travel"));
-  Serial.print(F("  SGTHRS="));
-  Serial.println(sgThreshold);
+  Serial.println(F("d: FREE vs BLOCK StallGuard test"));
+  Serial.println(F("  Be at mid-travel. REAL = CRC ok (chip value). CRC_FAIL = UART trash."));
 
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
-  // Clear a jam from a failed home (cmd '+'/retract = negative move)
-  Serial.println(F("  backoff retract 400..."));
-  stepper->move(-400);
-  waitStepperIdle();
-  delay(100);
+  uint16_t freeMax = 0, freeMin = 0xFFFF;
+  uint8_t freeOk = 0, freeFail = 0;
+  runSgPhase(F("--- PHASE 1: FREE (do not touch) ---"), 700, 16, freeMax, freeMin,
+             freeOk, freeFail);
 
-  Serial.println(F("  sampling while extending..."));
-  stepper->move(900);
+  Serial.println(F("--- PHASE 2 in 1s: HOLD/BLOCK the actuator firmly ---"));
+  delay(1000);
 
-  uint8_t n = 0;
-  uint8_t ok = 0;
-  uint8_t fail = 0;
-  uint16_t sgMax = 0;
-  uint16_t sgMinOk = 0xFFFF;
-  while (stepper->isRunning() && n < 35) {
-    const uint16_t sg = readStallGuard();
-    Serial.print(F("  sg="));
-    if (sg == 0xFFFF) {
-      Serial.println(F("crcFail"));
-      fail++;
-    } else {
-      Serial.println(sg);
-      ok++;
-      if (sg > sgMax) {
-        sgMax = sg;
-      }
-      if (sg < sgMinOk) {
-        sgMinOk = sg;
-      }
-    }
-    n++;
-    delay(40);
-  }
-  waitStepperIdle();
+  uint16_t blkMax = 0, blkMin = 0xFFFF;
+  uint8_t blkOk = 0, blkFail = 0;
+  runSgPhase(F("--- PHASE 2: BLOCKED ---"), 700, 16, blkMax, blkMin, blkOk, blkFail);
+
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
 
-  Serial.print(F("d: done  ok="));
-  Serial.print(ok);
-  Serial.print(F(" fail="));
-  Serial.print(fail);
-  Serial.print(F(" sgMax="));
-  Serial.print(sgMax);
-  Serial.print(F(" sgMin="));
-  Serial.println(sgMinOk == 0xFFFF ? 0 : sgMinOk);
-  if (sgMax < 5) {
-    Serial.println(F("  sgMax still low — manually +/- to mid-travel (unjam), then d again"));
+  Serial.println(F("=== SUMMARY ==="));
+  Serial.print(F("  FREE  ok/fail="));
+  Serial.print(freeOk);
+  Serial.print(F("/"));
+  Serial.print(freeFail);
+  Serial.print(F("  sg="));
+  Serial.print(freeMin == 0xFFFF ? 0 : freeMin);
+  Serial.print(F(".."));
+  Serial.println(freeMax);
+  Serial.print(F("  BLOCK ok/fail="));
+  Serial.print(blkOk);
+  Serial.print(F("/"));
+  Serial.print(blkFail);
+  Serial.print(F("  sg="));
+  Serial.print(blkMin == 0xFFFF ? 0 : blkMin);
+  Serial.print(F(".."));
+  Serial.println(blkMax);
+
+  if (freeOk < 3 || blkOk < 3) {
+    Serial.println(F("  Verdict: UART too unreliable while moving — fix reads first"));
+  } else if (freeMax <= 2 && blkMax <= 2) {
+    Serial.println(F("  Verdict: SG stuck ~0 even when free — StallGuard not active/measuring"));
+    Serial.println(F("    Check stealth=1, tstep not 1048575 while moving, spreadIO=0"));
+  } else if (freeMax > blkMax + 2) {
+    Serial.println(F("  Verdict: SG responds to load — use y between blockMax and freeMin"));
   } else {
-    Serial.print(F("  Try: y "));
-    Serial.print(sgMax >= 4 ? (sgMax / 2) : 2);
-    Serial.println(F("   then H"));
+    Serial.println(F("  Verdict: FREE and BLOCK look the same — weak/noisy SG, not usable yet"));
   }
 }
 
-// Poll SG while stepping. Stall detect is ARMED only after we see free SG
-// above threshold — avoids false home when jammed or UART returns 0s.
+// Poll SG while stepping.
+// y must be < free sgMax (≈12). If UART keeps failing we never arm and
+// would run forever — abort when CRC fail rate is too high.
 bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stepper || maxSteps <= 0) {
     return false;
@@ -317,6 +390,8 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   bool armed = false;
   bool stalled = false;
   uint16_t seenMax = 0;
+  uint16_t goodReads = 0;
+  uint16_t badReads = 0;
   delay(150);
 
   while (moved < maxSteps) {
@@ -327,9 +402,16 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
 
     uint16_t sgMin = 0xFFFF;
     uint16_t sgMaxChunk = 0;
+    uint8_t chunkGood = 0;
+    uint8_t chunkBad = 0;
     while (stepper->isRunning()) {
       const uint16_t sg = readStallGuard();
-      if (sg != 0xFFFF) {
+      if (sg == 0xFFFF) {
+        chunkBad++;
+        badReads++;
+      } else {
+        chunkGood++;
+        goodReads++;
         if (sg < sgMin) {
           sgMin = sg;
         }
@@ -339,33 +421,47 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
         if (sg > seenMax) {
           seenMax = sg;
         }
-        if (!armed && sg > (uint16_t)sgThreshold) {
+        if (!armed && sg >= HOME_ARM_SG) {
           armed = true;
         }
       }
-      delay(12);
+      delay(20);  // fewer, more reliable polls
     }
 
     const int32_t stepped = abs(stepper->getCurrentPosition() - pos0);
     moved += (stepped > 0) ? stepped : chunk;
 
     Serial.print(F("  sg="));
-    if (sgMin == 0xFFFF) {
-      Serial.print(F("crcFail"));
+    if (chunkGood == 0) {
+      Serial.print(F("noRead"));
     } else {
       Serial.print(sgMin);
       Serial.print(F(".."));
       Serial.print(sgMaxChunk);
     }
+    Serial.print(F(" ok/fail="));
+    Serial.print(chunkGood);
+    Serial.print(F("/"));
+    Serial.print(chunkBad);
     Serial.print(F(" maxSeen="));
     Serial.print(seenMax);
     Serial.print(F(" pos="));
     Serial.print(stepper->getCurrentPosition());
 
+    // Too many CRC failures → hand-stall can never be seen
+    if (badReads > 30 && goodReads * 2 < badReads) {
+      Serial.println(F("  ABORT: UART SG reads failing — not safe to home"));
+      stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
+      stepper->setSpeedInHz(moveSpeedHz);
+      stepper->setAcceleration(moveAccel);
+      return false;
+    }
+
     if (chunkIdx < HOME_IGNORE_CHUNKS || !armed) {
-      Serial.println(armed ? F(" (ignore)") : F(" (arming — need free SG > y)"));
+      Serial.println(armed ? F(" (ignore)") : F(" (arming)"));
       lowHits = 0;
-    } else if (sgMin != 0xFFFF && sgMin <= (uint16_t)sgThreshold) {
+    } else if (chunkGood > 0 && sgMin <= (uint16_t)sgThreshold) {
+      // Trip on low samples (hand/end). Require a few chunks in a row.
       lowHits++;
       Serial.print(F(" low "));
       Serial.print(lowHits);
@@ -386,7 +482,9 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   if (!stalled && !armed) {
     Serial.print(F("  never armed (sg max seen "));
     Serial.print(seenMax);
-    Serial.println(F(") — unjam mid-travel, raise current/speed, or lower y"));
+    Serial.print(F(", goodReads="));
+    Serial.print(goodReads);
+    Serial.println(F(") — check UART / mid-travel / y < free sgMax"));
   }
 
   if (stalled) {
@@ -496,7 +594,11 @@ void processCommand(String cmd) {
         driver.SGTHRS(sgThreshold);
       }
       Serial.print(F("SGTHRS="));
-      Serial.println(sgThreshold);
+      Serial.print(sgThreshold);
+      if (sgThreshold >= 12) {
+        Serial.print(F("  WARNING: free sgMax is ~12 — use y 3..6 or hand-stall won't trip"));
+      }
+      Serial.println();
     }
   } else if (c == 'g' || c == 'G') {
     int32_t dest = cmd.substring(1).toInt();
