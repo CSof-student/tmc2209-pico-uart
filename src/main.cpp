@@ -1,76 +1,114 @@
 #include <Arduino.h>
 #include <TMCStepper.h>
+#include <FastAccelStepper.h>
 
-// ---------- UART ----------
-#define TMC_TX 8
-#define TMC_RX 9
+// ---------------- Pins ----------------
+#define DIR_PIN     2
+#define STEP_PIN    3
+#define ENABLE_PIN  -1
 
+#define TX_PIN      8
+#define RX_PIN      9
+
+// ---------------- TMC2209 ----------------
 #define R_SENSE 0.11f
 #define DRIVER_ADDRESS 0b00
 
-// Pico hardware UART
-#define TMC_SERIAL Serial1
+TMC2209Stepper driver(&Serial1, R_SENSE, DRIVER_ADDRESS);
 
-TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
+// ---------------- Motion ----------------
+int32_t move_to_step = 3200 * 5;
+int32_t set_velocity = 3200;
+int32_t set_accel = 3200 * 100;
+int32_t set_current = 300;
+uint16_t motor_microsteps = 16;
+
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = nullptr;
 
 void setup() {
+  // USB Serial Monitor
   Serial.begin(115200);
 
-  delay(2000);
-
-  Serial.println();
-  Serial.println("TMC2209 UART test");
-
-  // Tell Serial1 which Pico pins to use
-  Serial1.setTX(TMC_TX);
-  Serial1.setRX(TMC_RX);
-
-  // TMC2209 UART
+  // Pico/Pico 2 hardware UART pin assignment
+  Serial1.setTX(TX_PIN);
+  Serial1.setRX(RX_PIN);
   Serial1.begin(115200);
 
-  delay(100);
+  pinMode(ENABLE_PIN, OUTPUT);
 
-  // Initialize driver
+  // ---------------- TMC2209 config ----------------
   driver.begin();
 
-  // Required so UART-controlled settings are used
-  driver.pdn_disable(true);
+  driver.toff(4);
+  driver.blank_time(24);
 
-  // Select microstep resolution from UART registers
+  driver.I_scale_analog(false);
+  driver.internal_Rsense(false);
+
   driver.mstep_reg_select(true);
+  driver.microsteps(motor_microsteps);
 
-  Serial.println("Driver initialized");
+  // StealthChop / StallGuard-related config
+  driver.TPWMTHRS(0);
+  driver.semin(0);
+  driver.en_spreadCycle(false);
 
-  // -------------------------
-  // Communication test
-  // -------------------------
+  driver.pdn_disable(true);
+  driver.VACTUAL(0);
 
-  uint32_t version = driver.version();
+  driver.rms_current(set_current);
 
-  Serial.print("TMC version = 0x");
-  Serial.println(version, HEX);
+  // StallGuard enabled over velocity range
+  driver.TCOOLTHRS(0xFFFFF);
 
-  uint32_t drvStatus = driver.DRV_STATUS();
+  // ---------------- FastAccelStepper ----------------
+  engine.init();
 
-  Serial.print("DRV_STATUS = 0x");
-  Serial.println(drvStatus, HEX);
+  stepper = engine.stepperConnectToPin(STEP_PIN);
 
-  // -------------------------
-  // Try writing some settings
-  // -------------------------
+  if (stepper) {
+    stepper->setDirectionPin(DIR_PIN);
+    stepper->setEnablePin(ENABLE_PIN);
+    stepper->setAutoEnable(true);
 
-  driver.rms_current(300);
-  driver.microsteps(16);
+    stepper->setSpeedInHz(set_velocity);
+    stepper->setAcceleration(set_accel);
+    stepper->setCurrentPosition(0);
+  }
 
-  Serial.print("Microsteps = ");
-  Serial.println(driver.microsteps());
-
-  Serial.print("Current scale = ");
-  Serial.println(driver.cs_actual());
-
-  Serial.println();
-  Serial.println("UART test complete");
+  Serial.println("Setup complete");
 }
 
+// Core 0
 void loop() {
+  // Serial monitor / Wi-Fi / other logic can live here
+}
+
+// Core 1
+void setup1() {
+}
+
+// This runs independently on the second Pico core.
+void loop1() {
+  if (!stepper) {
+    delay(10);
+    return;
+  }
+
+  stepper->moveTo(move_to_step);
+
+  while (stepper->isRunning()) {
+    delay(1);
+  }
+
+  delay(3000);
+
+  stepper->moveTo(0);
+
+  while (stepper->isRunning()) {
+    delay(1);
+  }
+
+  delay(3000);
 }
