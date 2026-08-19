@@ -34,7 +34,6 @@ static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 200;
 
 static const int32_t HOME_BACKOFF = 80;
-static const int32_t HOME_CHUNK = 800;
 static const int32_t HOME_MAX_TRAVEL = 20000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
@@ -388,7 +387,7 @@ int32_t clampToTravel(int32_t dest) {
 }
 
 // dirSign: -1 retract (toward 0 after home), +1 extend (toward travelMax)
-bool moveUntilStall(int dirSign, int32_t maxSteps) {
+bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
   if (!stepper || maxSteps <= 0) {
     return false;
   }
@@ -396,31 +395,74 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
   stepper->setSpeedInHz(HOME_SPEED_HZ);
   stepper->setAcceleration(HOME_ACCEL);
 
-  int32_t moved = 0;
-  bool stalled = false;
-  while (moved < maxSteps) {
-    const int32_t chunk = (maxSteps - moved > HOME_CHUNK) ? HOME_CHUNK : (maxSteps - moved);
-    stepper->move((int32_t)dirSign * chunk);
-    waitStepperIdle();
-    delay(8);
+  const uint16_t trip = (uint16_t)(2 * sgThreshold);
+  const int32_t startPos = stepper->getCurrentPosition();
 
+  Serial.print("--- ");
+  Serial.print(label);
+  Serial.print("  dir=");
+  Serial.print(dirSign > 0 ? "+" : "-");
+  Serial.print("  SGTHRS=");
+  Serial.print(sgThreshold);
+  Serial.print("  trip_below=");
+  Serial.print(trip);
+  Serial.print("  (stall if SG_RESULT < ");
+  Serial.print(trip);
+  Serial.println(") ---");
+  Serial.flush();
+
+  stepper->move((int32_t)dirSign * maxSteps);
+
+  uint16_t n = 0;
+  uint16_t lastSg = 0xFFFF;
+  bool stalled = false;
+  while (stepper->isRunning()) {
     const uint16_t sg = readStallGuard();
+    lastSg = sg;
+    n++;
+    const int32_t pos = stepper->getCurrentPosition();
+    Serial.print("  n=");
+    Serial.print(n);
     Serial.print("  sg=");
-    Serial.print(sg);
-    Serial.print(" pos=");
-    Serial.println(stepper->getCurrentPosition());
+    if (sg == 0xFFFF) {
+      Serial.print("UART?");
+    } else {
+      Serial.print(sg);
+    }
+    Serial.print("  trip=");
+    Serial.print(trip);
+    Serial.print("  stalled=");
+    Serial.print(isStalled(sg) ? "YES" : "no");
+    Serial.print("  pos=");
+    Serial.println(pos);
+    Serial.flush();
 
     if (isStalled(sg)) {
       stalled = true;
+      stepper->forceStopAndNewPosition(pos);
       break;
     }
-    moved += chunk;
+    delay(40);
   }
 
+  const int32_t endPos = stepper->getCurrentPosition();
+  Serial.print("  samples=");
+  Serial.print(n);
+  Serial.print("  last_sg=");
+  Serial.print(lastSg);
+  Serial.print("  moved=");
+  Serial.print(endPos - startPos);
+  Serial.print("  -> ");
   if (stalled) {
+    Serial.println("STALL");
     stepper->move((int32_t)(-dirSign) * HOME_BACKOFF);
     waitStepperIdle();
+    Serial.print("  backoff to pos=");
+    Serial.println(stepper->getCurrentPosition());
+  } else {
+    Serial.println("NO STALL (hit max travel or stopped)");
   }
+  Serial.flush();
 
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
@@ -444,7 +486,7 @@ void homeBothEnds() {
   Serial.println(HOME_ACCEL);
 
   say("Seeking RETRACTED (+) ...");
-  if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
+  if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT")) {
     say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
     travelCalibrated = false;
     return;
@@ -455,7 +497,7 @@ void homeBothEnds() {
   delay(100);
 
   say("Seeking EXTENDED (-) ...");
-  if (!moveUntilStall(+1, HOME_MAX_TRAVEL)) {
+  if (!moveUntilStall(+1, HOME_MAX_TRAVEL, "EXTEND")) {
     say("EXTEND: no stall — raise y or check mechanics");
     travelCalibrated = false;
     return;
