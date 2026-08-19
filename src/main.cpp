@@ -274,15 +274,17 @@ bool startLongExtend(uint32_t durationMs) {
   }
 
   const int32_t pos = stepper->getCurrentPosition();
-  int32_t dest = pos + (int32_t)steps;
+  // '-' nudge extends (positive in comments) but this wiring retracts on
+  // moveTo(pos+steps). Extend is the other way.
+  int32_t dest = pos - (int32_t)steps;
   if (travelCalibrated) {
-    const int32_t limit = travelMax - HOME_BACKOFF;
-    const int32_t room = limit - pos;
+    const int32_t limit = travelMin + HOME_BACKOFF;
+    const int32_t room = pos - limit;
     if (room < (int32_t)moveSpeedHz * 8) {
-      say("Not enough room to extend. Retract with + or g 0, then f again.");
+      say("Not enough room to extend. Jog '-' toward the out end, then f again.");
       return false;
     }
-    if (dest > limit) {
+    if (dest < limit) {
       dest = limit;
     }
   }
@@ -308,7 +310,7 @@ void fingerStallTest() {
 
   say("");
   say("FINGER STALL TEST — one-way extend");
-  say("Start from the IN / retracted side so there is travel.");
+  say("Start from the retracted / IN side so there is travel outward.");
   say("Hands OFF. Sampling free run...");
   Serial.flush();
   delayMs(500);
