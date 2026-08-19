@@ -33,11 +33,11 @@ static const uint32_t DEFAULT_SPEED_HZ = 200;
 static const uint32_t DEFAULT_ACCEL = 400;
 static const int32_t DEFAULT_STEP_SIZE = 200;
 
-static const int32_t HOME_BACKOFF = 32;
-static const int32_t HOME_CHUNK = 40;
+static const int32_t HOME_BACKOFF = 80;
+static const int32_t HOME_CHUNK = 800;
 static const int32_t HOME_MAX_TRAVEL = 20000;
-static const uint32_t HOME_SPEED_HZ = 150;
-static const uint32_t HOME_ACCEL = 300;
+static const uint32_t HOME_SPEED_HZ = 2500;
+static const uint32_t HOME_ACCEL = 20000;
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -70,7 +70,7 @@ void printHelp() {
   Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    f finger stall test (one-way extend)    y <0-255>    H home");
+  Serial.println("  z SG read    f [steps] finger stall (two short extends)    y <0-255>    H home");
 }
 
 void printStatus() {
@@ -199,8 +199,9 @@ void startSweep(int32_t amplitude) {
   Serial.println("  (z to read SG, f = free vs finger stall, w or x to stop)");
 }
 
-static const uint8_t SG_TEST_N = 30;
-static const uint16_t SG_TEST_PERIOD_MS = 80;
+static const uint8_t SG_TEST_N = 20;
+static const uint16_t SG_TEST_PERIOD_MS = 50;
+static const int32_t FINGER_TEST_STEPS = 1800;
 
 void delayMs(uint32_t ms) {
   const uint32_t t0 = millis();
@@ -209,11 +210,18 @@ void delayMs(uint32_t ms) {
   }
 }
 
-void collectSg(uint16_t *buf, uint8_t n) {
-  for (uint8_t i = 0; i < n; i++) {
-    buf[i] = readStallGuard();
+uint8_t collectSgWhileMoving(uint16_t *buf, uint8_t maxN) {
+  uint8_t n = 0;
+  const uint32_t giveUp = millis() + 2500;
+  while (n < maxN && millis() < giveUp) {
+    if (stepper && stepper->isRunning()) {
+      buf[n++] = readStallGuard();
+    } else if (n > 0) {
+      break;
+    }
     delayMs(SG_TEST_PERIOD_MS);
   }
+  return n;
 }
 
 void sortU16(uint16_t *v, uint8_t n) {
@@ -265,23 +273,18 @@ bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
   return true;
 }
 
-bool startLongExtend(uint32_t durationMs) {
+bool startExtendBurst(int32_t steps) {
   stopMotion();
-
-  uint32_t steps = ((uint32_t)moveSpeedHz * (durationMs + 2000UL)) / 1000UL;
-  if (steps < 2000) {
-    steps = 2000;
+  if (steps < 200) {
+    steps = 200;
   }
 
   const int32_t pos = stepper->getCurrentPosition();
-  // '-' nudge extends (positive in comments) but this wiring retracts on
-  // moveTo(pos+steps). Extend is the other way.
-  int32_t dest = pos - (int32_t)steps;
+  int32_t dest = pos - steps;  // extend on this wiring
   if (travelCalibrated) {
     const int32_t limit = travelMin + HOME_BACKOFF;
-    const int32_t room = pos - limit;
-    if (room < (int32_t)moveSpeedHz * 8) {
-      say("Not enough room to extend. Jog '-' toward the out end, then f again.");
+    if (pos - limit < steps / 2) {
+      say("Not enough room to extend. Jog toward IN, then f again.");
       return false;
     }
     if (dest < limit) {
@@ -290,56 +293,58 @@ bool startLongExtend(uint32_t durationMs) {
   }
 
   stepper->moveTo(dest);
-  Serial.print("extending to pos ");
-  Serial.print(dest);
-  Serial.println(" (one way, no reverse)");
+  Serial.print("extending ");
+  Serial.print(steps);
+  Serial.println(" steps (short burst)");
   return true;
 }
 
-void fingerStallTest() {
+void fingerStallTest(int32_t steps) {
   if (!stepper) {
     say("no stepper");
     return;
   }
 
-  // Free ~2.4s + 5s to grab + stall ~2.4s, with margin
-  const uint32_t needMs = 14000;
-  if (!startLongExtend(needMs)) {
+  say("");
+  say("FINGER STALL TEST — two short one-way extends");
+  say("Start from IN. Hands OFF for the first move.");
+  Serial.flush();
+
+  if (!startExtendBurst(steps)) {
     return;
   }
-
-  say("");
-  say("FINGER STALL TEST — one-way extend");
-  say("Start from the retracted / IN side so there is travel outward.");
-  say("Hands OFF. Sampling free run...");
-  Serial.flush();
-  delayMs(500);
+  delayMs(120);
 
   uint16_t freeBuf[SG_TEST_N];
   uint16_t stallBuf[SG_TEST_N];
-  collectSg(freeBuf, SG_TEST_N);
+  const uint8_t nFree = collectSgWhileMoving(freeBuf, SG_TEST_N);
+  stopMotion();
 
   say("");
-  say("NOW HOLD THE SHAFT so it cannot keep extending.");
-  say("Sampling stall in:");
+  say("Motor stopped. Get ready to HOLD the shaft.");
+  say("Next extend in:");
   for (int i = 5; i >= 1; i--) {
     Serial.print("  ");
     Serial.println(i);
     Serial.flush();
     delayMs(1000);
   }
-  say("Sampling WHILE you hold...");
+  say("HOLD NOW — extending into your finger...");
   Serial.flush();
-  collectSg(stallBuf, SG_TEST_N);
 
+  if (!startExtendBurst(steps)) {
+    return;
+  }
+  delayMs(120);
+  const uint8_t nStall = collectSgWhileMoving(stallBuf, SG_TEST_N);
   stopMotion();
   say("Done — you can let go.");
   say("");
 
   uint16_t freeMed = 0, freeMin = 0, freeMax = 0;
   uint16_t stallMed = 0, stallMin = 0, stallMax = 0;
-  const bool okFree = summarizeSg("FREE ", freeBuf, SG_TEST_N, freeMed, freeMin, freeMax);
-  const bool okStall = summarizeSg("STALL", stallBuf, SG_TEST_N, stallMed, stallMin, stallMax);
+  const bool okFree = summarizeSg("FREE ", freeBuf, nFree, freeMed, freeMin, freeMax);
+  const bool okStall = summarizeSg("STALL", stallBuf, nStall, stallMed, stallMin, stallMax);
   if (!okFree || !okStall) {
     return;
   }
@@ -432,7 +437,11 @@ void homeBothEnds() {
   say("StallGuard home (+retract / -extend)...");
   setupStallGuard(sgThreshold);
   Serial.print("SGTHRS=");
-  Serial.println(sgThreshold);
+  Serial.print(sgThreshold);
+  Serial.print("  home speed=");
+  Serial.print(HOME_SPEED_HZ);
+  Serial.print(" Hz  accel=");
+  Serial.println(HOME_ACCEL);
 
   say("Seeking RETRACTED (+) ...");
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL)) {
@@ -536,7 +545,14 @@ void processCommand(String cmd) {
     Serial.print("  stalled=");
     Serial.println(isStalled(sg) ? "yes" : "no");
   } else if (c == 'f' || c == 'F') {
-    fingerStallTest();
+    int32_t steps = FINGER_TEST_STEPS;
+    if (cmd.length() > 1) {
+      const int32_t v = cmd.substring(1).toInt();
+      if (v > 0) {
+        steps = v;
+      }
+    }
+    fingerStallTest(steps);
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
