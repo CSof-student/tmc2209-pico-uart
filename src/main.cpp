@@ -37,6 +37,7 @@ static const int32_t HOME_BACKOFF = 80;
 static const int32_t HOME_MAX_TRAVEL = 20000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
+static const uint8_t STALL_CONFIRM = 4;
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -131,13 +132,27 @@ bool isStalled(uint16_t sg) {
   return sg < (uint16_t)(2 * sgThreshold);
 }
 
-void waitStepperIdle() {
+void waitStepperIdle(uint32_t timeoutMs = 2000) {
   if (!stepper) {
     return;
   }
+  const uint32_t t0 = millis();
   while (stepper->isRunning()) {
+    if (millis() - t0 > timeoutMs) {
+      stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
+      say("motion idle timeout — force stop");
+      return;
+    }
     delay(1);
   }
+}
+
+void applyHomeMotion() {
+  if (!stepper) {
+    return;
+  }
+  stepper->setSpeedInHz(HOME_SPEED_HZ);
+  stepper->setAcceleration(HOME_ACCEL);
 }
 
 void stopMotion() {
@@ -392,8 +407,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
     return false;
   }
 
-  stepper->setSpeedInHz(HOME_SPEED_HZ);
-  stepper->setAcceleration(HOME_ACCEL);
+  applyHomeMotion();
 
   const uint16_t trip = (uint16_t)(2 * sgThreshold);
   const int32_t startPos = stepper->getCurrentPosition();
@@ -406,14 +420,17 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
   Serial.print(sgThreshold);
   Serial.print("  trip_below=");
   Serial.print(trip);
-  Serial.print("  (stall if SG_RESULT < ");
-  Serial.print(trip);
-  Serial.println(") ---");
-  Serial.flush();
+  Serial.print("  need ");
+  Serial.print(STALL_CONFIRM);
+  Serial.print(" in a row  speed=");
+  Serial.print(HOME_SPEED_HZ);
+  Serial.print(" accel=");
+  Serial.println(HOME_ACCEL);
 
   stepper->move((int32_t)dirSign * maxSteps);
 
   uint16_t n = 0;
+  uint8_t stallHits = 0;
   uint16_t lastSg = 0xFFFF;
   bool stalled = false;
   while (stepper->isRunning()) {
@@ -421,6 +438,13 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
     lastSg = sg;
     n++;
     const int32_t pos = stepper->getCurrentPosition();
+    const bool hit = isStalled(sg);
+    if (hit) {
+      stallHits++;
+    } else {
+      stallHits = 0;
+    }
+
     Serial.print("  n=");
     Serial.print(n);
     Serial.print("  sg=");
@@ -431,13 +455,14 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
     }
     Serial.print("  trip=");
     Serial.print(trip);
-    Serial.print("  stalled=");
-    Serial.print(isStalled(sg) ? "YES" : "no");
+    Serial.print("  hits=");
+    Serial.print(stallHits);
+    Serial.print("/");
+    Serial.print(STALL_CONFIRM);
     Serial.print("  pos=");
     Serial.println(pos);
-    Serial.flush();
 
-    if (isStalled(sg)) {
+    if (stallHits >= STALL_CONFIRM) {
       stalled = true;
       stepper->forceStopAndNewPosition(pos);
       break;
@@ -455,17 +480,15 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
   Serial.print("  -> ");
   if (stalled) {
     Serial.println("STALL");
+    applyHomeMotion();
     stepper->move((int32_t)(-dirSign) * HOME_BACKOFF);
-    waitStepperIdle();
+    waitStepperIdle(1500);
     Serial.print("  backoff to pos=");
     Serial.println(stepper->getCurrentPosition());
   } else {
     Serial.println("NO STALL (hit max travel or stopped)");
   }
-  Serial.flush();
 
-  stepper->setSpeedInHz(moveSpeedHz);
-  stepper->setAcceleration(moveAccel);
   return stalled;
 }
 
@@ -489,6 +512,8 @@ void homeBothEnds() {
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT")) {
     say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
     travelCalibrated = false;
+    stepper->setSpeedInHz(moveSpeedHz);
+    stepper->setAcceleration(moveAccel);
     return;
   }
   stepper->setCurrentPosition(0);
@@ -500,18 +525,24 @@ void homeBothEnds() {
   if (!moveUntilStall(+1, HOME_MAX_TRAVEL, "EXTEND")) {
     say("EXTEND: no stall — raise y or check mechanics");
     travelCalibrated = false;
+    stepper->setSpeedInHz(moveSpeedHz);
+    stepper->setAcceleration(moveAccel);
     return;
   }
   travelMax = stepper->getCurrentPosition();
   if (travelMax < HOME_BACKOFF * 2) {
     say("Travel too short — tune y / speed / current");
     travelCalibrated = false;
+    stepper->setSpeedInHz(moveSpeedHz);
+    stepper->setAcceleration(moveAccel);
     return;
   }
   travelCalibrated = true;
   Serial.print("Travel 0 (retract) .. ");
   Serial.print(travelMax);
   Serial.println(" (extend)");
+  stepper->setSpeedInHz(moveSpeedHz);
+  stepper->setAcceleration(moveAccel);
   say("Home done. +retracts -extends; g 0 / g <max>");
 }
 
