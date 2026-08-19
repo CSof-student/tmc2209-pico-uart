@@ -1,21 +1,25 @@
 /*
-  UART test: hardware UART + TMCStepper only.
+  TMC2209 UART (Serial2 / UART1) + FastAccelStepper.
 
-  On Arduino-Pico, Serial1 is UART0 (GP0/GP1). GP8/GP9 are UART1, which is
-  Serial2. Using Serial1.setTX(8) is an illegal pin and can hang the core.
+  GP8/GP9 are UART1, so this uses Serial2 — Serial1 is UART0 and will hang
+  if you setTX(8). No soft UART.
 
-  Wiring (single-wire UART pin on the TMC):
-    Pico GP8 (TX) --[1k]--+---- TMC UART
-    Pico GP9 (RX) --------+
+  Wiring:
+    GP8 --[1k]--+---- TMC UART
+    GP9 --------+
+    STEP GP3, DIR GP2, EN -> GND
+    VIO 3.3V, VM motor PSU, GND common
 
-  USB serial 115200. Commands:
-    k  pin levels
-    b  UART loopback (TMC UART wires OFF, jumper GP8 to GP9; 1k optional)
-    t  TMC UART test (test_connection + version)
+  USB 115200. Commands: t = UART test, h = help.
 */
 
 #include <Arduino.h>
 #include <TMCStepper.h>
+#include <FastAccelStepper.h>
+
+#define DIR_PIN    2
+#define STEP_PIN   3
+#define ENABLE_PIN -1
 
 #define TX_PIN 8
 #define RX_PIN 9
@@ -23,91 +27,42 @@
 #define R_SENSE 0.11f
 #define DRIVER_ADDRESS 0b00
 
-// UART1 — the UART that can actually use GP8/GP9
 #define TMC_SERIAL Serial2
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
+
+int32_t move_to_step = 3200 * 5;
+int32_t set_velocity = 3200;
+int32_t set_accel = 3200 * 100;
+int32_t set_current = 300;
+uint16_t motor_microsteps = 16;
+
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *stepper = nullptr;
 
 void say(const char *msg) {
   Serial.println(msg);
   Serial.flush();
 }
 
-void printHelp() {
-  Serial.println();
-  Serial.println("Commands:");
-  Serial.println("  k  pin check (GP8 TX / GP9 RX levels)");
-  Serial.println("  b  Serial2 loopback — disconnect TMC UART, jumper GP8-GP9");
-  Serial.println("  t  TMC UART test (needs TMC wired, VM + VIO on)");
-  Serial.println("  h  help");
-  Serial.flush();
-}
-
-void pinCheck() {
-  const int tx = digitalRead(TX_PIN);
-  const int rx = digitalRead(RX_PIN);
-  Serial.print("GP8 TX = ");
-  Serial.println(tx ? "HIGH" : "LOW");
-  Serial.print("GP9 RX = ");
-  Serial.println(rx ? "HIGH" : "LOW");
-  Serial.println("Idle UART should be HIGH on both.");
-  Serial.flush();
-}
-
-void drainRx() {
-  int n = 0;
-  while (n < 64 && TMC_SERIAL.available() > 0) {
-    (void)TMC_SERIAL.read();
-    n++;
+void setupStepper() {
+  engine.init();
+  stepper = engine.stepperConnectToPin(STEP_PIN);
+  if (!stepper) {
+    say("FastAccelStepper failed to claim STEP pin");
+    return;
   }
-}
-
-void serial2Loopback() {
-  say("b: drain RX (max 64 bytes, not forever)");
-  drainRx();
-  say("b: waiting for TX ready (200 ms timeout)");
-
-  const uint32_t readyStart = millis();
-  while (TMC_SERIAL.availableForWrite() < 1) {
-    if (millis() - readyStart > 200) {
-      say("b: HANG AVOIDED — UART TX never writable. Pin mux / UART still stuck.");
-      return;
-    }
-  }
-
-  say("b: writing 0xA5 (GP8 jumpered to GP9, TMC UART OFF)");
-  const size_t n = TMC_SERIAL.write((uint8_t)0xA5);
-  Serial.print("b: write returned ");
-  Serial.println(n);
-  Serial.flush();
-
-  int got = -1;
-  const uint32_t start = millis();
-  while (millis() - start < 200) {
-    if (TMC_SERIAL.available()) {
-      got = TMC_SERIAL.read();
-      break;
-    }
-    delay(1);
-  }
-
-  if (got == 0xA5) {
-    say("b: Serial2 loopback OK — UART1 on GP8/GP9 works");
-  } else {
-    Serial.print("b: Serial2 loopback FAIL (got ");
-    Serial.print(got);
-    Serial.println(")");
-    Serial.println("   Direct jumper is fine for this test; 1k is also OK.");
-    Serial.flush();
-  }
+  stepper->setDirectionPin(DIR_PIN);
+  stepper->setEnablePin(ENABLE_PIN);
+  stepper->setAutoEnable(true);
+  stepper->setSpeedInHz(set_velocity);
+  stepper->setAcceleration(set_accel);
+  stepper->setCurrentPosition(0);
+  say("Stepper ready");
 }
 
 void uartTest() {
-  say("t: calling driver.begin() (UART writes)...");
-  driver.begin();
-  say("t: driver.begin() returned");
-
-  say("t: test_connection() (reads DRV_STATUS)...");
+  say("t: test_connection()...");
   const uint8_t conn = driver.test_connection();
   Serial.print("t: test_connection = ");
   Serial.print(conn);
@@ -122,57 +77,54 @@ void uartTest() {
   }
   Serial.flush();
 
-  say("t: driver.version()...");
   const uint8_t ver = driver.version();
   Serial.print("t: TMC version = 0x");
   Serial.println(ver, HEX);
   if (ver == 0x21) {
     say("t: UART OK (TMC2209)");
   } else {
-    say("t: no valid version — UART port may be fine (run b) but the TMC is not answering");
+    say("t: no valid version");
   }
+}
 
-  Serial.print("t: DRV_STATUS = 0x");
-  Serial.println(driver.DRV_STATUS(), HEX);
-  Serial.print("t: IFCNT = ");
-  Serial.println(driver.IFCNT());
-  Serial.flush();
+void setupDriver() {
+  TMC_SERIAL.setPollingMode(true);
+  if (!TMC_SERIAL.setTX(TX_PIN) || !TMC_SERIAL.setRX(RX_PIN)) {
+    say("Serial2 setTX/setRX failed — GP8/GP9 must use Serial2 (UART1)");
+    return;
+  }
+  TMC_SERIAL.begin(115200);
+  delay(50);
+  say("Serial2.begin returned");
+
+  driver.begin();
+  driver.toff(4);
+  driver.blank_time(24);
+  driver.I_scale_analog(false);
+  driver.internal_Rsense(false);
+  driver.mstep_reg_select(true);
+  driver.microsteps(motor_microsteps);
+  driver.TPWMTHRS(0);
+  driver.semin(0);
+  driver.en_spreadCycle(false);
+  driver.pdn_disable(true);
+  driver.VACTUAL(0);
+  driver.rms_current(set_current);
+  driver.TCOOLTHRS(0);  // StallGuard off until UART + motion are confirmed
+
+  uartTest();
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1500);
-  say("");
-  say("TMC2209 UART test (Serial2 = UART1 on GP8/GP9, no soft UART, no motion)");
+  say("TMC2209 Serial2 UART + motion (no soft UART)");
 
-  Serial.print("before Serial2.setTX/RX  GP8=");
-  Serial.print(TX_PIN);
-  Serial.print(" GP9=");
-  Serial.println(RX_PIN);
-  Serial.flush();
+  // STEP/DIR first so a UART problem cannot block pulses.
+  setupStepper();
+  setupDriver();
 
-  // Polling avoids UART IRQ + FreeRTOS mutex deadlocks that look like a hang.
-  TMC_SERIAL.setPollingMode(true);
-
-  const bool txOk = TMC_SERIAL.setTX(TX_PIN);
-  const bool rxOk = TMC_SERIAL.setRX(RX_PIN);
-  Serial.print("setTX(8) = ");
-  Serial.println(txOk ? "ok" : "FAIL");
-  Serial.print("setRX(9) = ");
-  Serial.println(rxOk ? "ok" : "FAIL");
-  Serial.flush();
-  if (!txOk || !rxOk) {
-    say("Illegal UART pins — this sketch would hang if it used Serial1 (UART0).");
-  }
-
-  say("before Serial2.begin(115200)");
-  TMC_SERIAL.begin(115200);
-  delay(50);
-  say("Serial2.begin returned — UART1 started");
-
-  pinCheck();
-  printHelp();
-  say("Ready. Run b (loopback) first, then t with the TMC wired.");
+  say("Setup complete. Motor should cycle. Type t to retest UART, h for help.");
 }
 
 void loop() {
@@ -188,22 +140,38 @@ void loop() {
   switch (c) {
     case 'h':
     case '?':
-      printHelp();
-      break;
-    case 'k':
-      pinCheck();
-      break;
-    case 'b':
-      serial2Loopback();
+      say("t  UART test");
+      say("h  help");
       break;
     case 't':
       uartTest();
       break;
     default:
-      Serial.print("unknown command '");
+      Serial.print("unknown '");
       Serial.print(c);
       Serial.println("' — h for help");
       Serial.flush();
       break;
   }
+}
+
+void setup1() {}
+
+void loop1() {
+  if (!stepper) {
+    delay(10);
+    return;
+  }
+
+  stepper->moveTo(move_to_step);
+  while (stepper->isRunning()) {
+    delay(1);
+  }
+  delay(3000);
+
+  stepper->moveTo(0);
+  while (stepper->isRunning()) {
+    delay(1);
+  }
+  delay(3000);
 }
