@@ -70,7 +70,7 @@ void printHelp() {
   Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    f finger stall test    y <0-255> SG thresh    H home");
+  Serial.println("  z SG read    f finger stall test (one-way extend)    y <0-255>    H home");
 }
 
 void printStatus() {
@@ -202,10 +202,9 @@ void startSweep(int32_t amplitude) {
 static const uint8_t SG_TEST_N = 30;
 static const uint16_t SG_TEST_PERIOD_MS = 80;
 
-void delayWhileSweep(uint32_t ms) {
+void delayMs(uint32_t ms) {
   const uint32_t t0 = millis();
   while (millis() - t0 < ms) {
-    serviceSweep();
     delay(5);
   }
 }
@@ -213,7 +212,7 @@ void delayWhileSweep(uint32_t ms) {
 void collectSg(uint16_t *buf, uint8_t n) {
   for (uint8_t i = 0; i < n; i++) {
     buf[i] = readStallGuard();
-    delayWhileSweep(SG_TEST_PERIOD_MS);
+    delayMs(SG_TEST_PERIOD_MS);
   }
 }
 
@@ -266,38 +265,66 @@ bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
   return true;
 }
 
+bool startLongExtend(uint32_t durationMs) {
+  stopMotion();
+
+  uint32_t steps = ((uint32_t)moveSpeedHz * (durationMs + 2000UL)) / 1000UL;
+  if (steps < 2000) {
+    steps = 2000;
+  }
+
+  const int32_t pos = stepper->getCurrentPosition();
+  int32_t dest = pos + (int32_t)steps;
+  if (travelCalibrated) {
+    const int32_t limit = travelMax - HOME_BACKOFF;
+    const int32_t room = limit - pos;
+    if (room < (int32_t)moveSpeedHz * 8) {
+      say("Not enough room to extend. Retract with + or g 0, then f again.");
+      return false;
+    }
+    if (dest > limit) {
+      dest = limit;
+    }
+  }
+
+  stepper->moveTo(dest);
+  Serial.print("extending to pos ");
+  Serial.print(dest);
+  Serial.println(" (one way, no reverse)");
+  return true;
+}
+
 void fingerStallTest() {
   if (!stepper) {
     say("no stepper");
     return;
   }
 
-  if (!sweepEnabled) {
-    const int32_t amp = stepSize * 4 > 800 ? stepSize * 4 : 800;
-    startSweep(amp);
-  }
-  if (!sweepEnabled) {
+  // Free ~2.4s + 5s to grab + stall ~2.4s, with margin
+  const uint32_t needMs = 14000;
+  if (!startLongExtend(needMs)) {
     return;
   }
 
   say("");
-  say("FINGER STALL TEST");
-  say("Hands OFF the shaft. Sampling free run...");
+  say("FINGER STALL TEST — one-way extend");
+  say("Start from the IN / retracted side so there is travel.");
+  say("Hands OFF. Sampling free run...");
   Serial.flush();
-  delayWhileSweep(400);
+  delayMs(500);
 
   uint16_t freeBuf[SG_TEST_N];
   uint16_t stallBuf[SG_TEST_N];
   collectSg(freeBuf, SG_TEST_N);
 
   say("");
-  say("NOW HOLD THE SHAFT so the motor cannot move.");
+  say("NOW HOLD THE SHAFT so it cannot keep extending.");
   say("Sampling stall in:");
   for (int i = 5; i >= 1; i--) {
     Serial.print("  ");
     Serial.println(i);
     Serial.flush();
-    delayWhileSweep(1000);
+    delayMs(1000);
   }
   say("Sampling WHILE you hold...");
   Serial.flush();
