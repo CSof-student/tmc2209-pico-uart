@@ -52,6 +52,10 @@ uint8_t sgThreshold = 50;  // higher = more sensitive
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
+bool sweepEnabled = false;
+int32_t sweepLo = 0;
+int32_t sweepHi = 0;
+int32_t sweepTarget = 0;
 String line;
 
 void say(const char *msg) {
@@ -65,6 +69,7 @@ void printHelp() {
   Serial.println("  h/? help     t UART test     i status     x stop");
   Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
+  Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG read    y <0-255> SG thresh    H home both ends");
 }
 
@@ -78,7 +83,9 @@ void printStatus() {
   Serial.print("  rms_mA=");
   Serial.print(rmsMa);
   Serial.print("  SGTHRS=");
-  Serial.println(sgThreshold);
+  Serial.print(sgThreshold);
+  Serial.print("  sweep=");
+  Serial.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
     Serial.print("  travel=0 (retract) .. ");
     Serial.print(travelMax);
@@ -124,6 +131,64 @@ void waitStepperIdle() {
   while (stepper->isRunning()) {
     delay(1);
   }
+}
+
+void stopMotion() {
+  sweepEnabled = false;
+  if (stepper) {
+    stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
+  }
+}
+
+void serviceSweep() {
+  if (!sweepEnabled || !stepper || stepper->isRunning()) {
+    return;
+  }
+  sweepTarget = (sweepTarget == sweepHi) ? sweepLo : sweepHi;
+  stepper->moveTo(sweepTarget);
+}
+
+void startSweep(int32_t amplitude) {
+  if (!stepper) {
+    say("no stepper");
+    return;
+  }
+  if (amplitude < 40) {
+    amplitude = 40;
+  }
+
+  const int32_t pos = stepper->getCurrentPosition();
+  if (travelCalibrated) {
+    const int32_t inset = (travelMax > HOME_BACKOFF * 8) ? (travelMax / 10) : HOME_BACKOFF;
+    sweepLo = travelMin + inset;
+    sweepHi = travelMax - inset;
+    if (sweepHi - sweepLo < 40) {
+      say("travel too short to sweep — skip H ends, or don't run H and use w <amp>");
+      return;
+    }
+  } else {
+    sweepLo = pos - amplitude / 2;
+    sweepHi = pos + amplitude / 2;
+  }
+
+  if (moveAccel < (int32_t)(moveSpeedHz * 2)) {
+    Serial.print("accel ");
+    Serial.print(moveAccel);
+    Serial.print(" is low for speed ");
+    Serial.print(moveSpeedHz);
+    Serial.println(" — raise a so it reaches cruise (try a = 10x speed)");
+  }
+
+  sweepEnabled = true;
+  sweepTarget = (pos < (sweepLo + sweepHi) / 2) ? sweepHi : sweepLo;
+  stepper->moveTo(sweepTarget);
+  Serial.print("sweep ON  ");
+  Serial.print(sweepLo);
+  Serial.print(" .. ");
+  Serial.print(sweepHi);
+  Serial.print("  speedHz=");
+  Serial.print(moveSpeedHz);
+  Serial.println("  (z to read SG, w or x to stop)");
 }
 
 int32_t clampToTravel(int32_t dest) {
@@ -184,6 +249,7 @@ void homeBothEnds() {
     say("no stepper");
     return;
   }
+  stopMotion();
 
   say("StallGuard home (+retract / -extend)...");
   setupStallGuard(sgThreshold);
@@ -285,7 +351,11 @@ void processCommand(String cmd) {
     Serial.print("SG_RESULT=");
     Serial.print(sg);
     Serial.print("  SGTHRS=");
-    Serial.println(sgThreshold);
+    Serial.print(sgThreshold);
+    Serial.print("  moving=");
+    Serial.print(stepper && stepper->isRunning() ? "yes" : "no");
+    Serial.print("  pos=");
+    Serial.println(stepper ? stepper->getCurrentPosition() : 0);
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
@@ -293,10 +363,25 @@ void processCommand(String cmd) {
       Serial.print("SGTHRS=");
       Serial.println(sgThreshold);
     }
+  } else if (c == 'w' || c == 'W') {
+    if (sweepEnabled) {
+      stopMotion();
+      say("sweep OFF");
+    } else {
+      int32_t amp = stepSize * 4;
+      if (cmd.length() > 1) {
+        const int32_t v = cmd.substring(1).toInt();
+        if (v > 0) {
+          amp = v;
+        }
+      }
+      startSweep(amp);
+    }
   } else if (c == 'g' || c == 'G') {
     if (!stepper) {
       return;
     }
+    stopMotion();
     const int32_t dest = clampToTravel(cmd.substring(1).toInt());
     stepper->moveTo(dest);
     Serial.print("goto ");
@@ -310,6 +395,7 @@ void processCommand(String cmd) {
       }
       delta = (c == '+') ? -mag : mag;
     }
+    stopMotion();
     if (stepper) {
       const int32_t dest = clampToTravel(stepper->getCurrentPosition() + delta);
       delta = dest - stepper->getCurrentPosition();
@@ -359,9 +445,7 @@ void processCommand(String cmd) {
       Serial.println(motor_microsteps);
     }
   } else if (c == 'x' || c == 'X') {
-    if (stepper) {
-      stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
-    }
+    stopMotion();
     say("stop");
   } else {
     say("unknown (h)");
@@ -380,6 +464,8 @@ void setup() {
 }
 
 void loop() {
+  serviceSweep();
+
   while (Serial.available()) {
     const char ch = (char)Serial.read();
     if (ch == '\n' || ch == '\r') {
