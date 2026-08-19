@@ -37,7 +37,7 @@ static const int32_t HOME_BACKOFF = 80;
 static const int32_t HOME_MAX_TRAVEL = 20000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
-static const uint8_t STALL_CONFIRM = 4;
+static const uint8_t STALL_CONFIRM = 10;
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
