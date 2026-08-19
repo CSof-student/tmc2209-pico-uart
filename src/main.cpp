@@ -48,7 +48,7 @@ uint16_t rmsMa = DEFAULT_RMS_MA;
 uint16_t motor_microsteps = DEFAULT_MICROSTEPS;
 uint32_t moveSpeedHz = DEFAULT_SPEED_HZ;
 int32_t moveAccel = DEFAULT_ACCEL;
-uint8_t sgThreshold = 50;  // higher = more sensitive
+uint8_t sgThreshold = 50;  // stall when SG_RESULT < 2 * SGTHRS; higher y = more sensitive
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
@@ -70,7 +70,7 @@ void printHelp() {
   Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    y <0-255> SG thresh    H home both ends");
+  Serial.println("  z SG read    f finger stall test    y <0-255> SG thresh    H home");
 }
 
 void printStatus() {
@@ -122,6 +122,14 @@ uint16_t readStallGuard() {
     return 0xFFFF;
   }
   return sg;
+}
+
+// TMC2209: DIAG / stall when SG_RESULT < 2 * SGTHRS
+bool isStalled(uint16_t sg) {
+  if (sg == 0xFFFF) {
+    return false;
+  }
+  return sg < (uint16_t)(2 * sgThreshold);
 }
 
 void waitStepperIdle() {
@@ -188,7 +196,148 @@ void startSweep(int32_t amplitude) {
   Serial.print(sweepHi);
   Serial.print("  speedHz=");
   Serial.print(moveSpeedHz);
-  Serial.println("  (z to read SG, w or x to stop)");
+  Serial.println("  (z to read SG, f = free vs finger stall, w or x to stop)");
+}
+
+static const uint8_t SG_TEST_N = 30;
+static const uint16_t SG_TEST_PERIOD_MS = 80;
+
+void delayWhileSweep(uint32_t ms) {
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    serviceSweep();
+    delay(5);
+  }
+}
+
+void collectSg(uint16_t *buf, uint8_t n) {
+  for (uint8_t i = 0; i < n; i++) {
+    buf[i] = readStallGuard();
+    delayWhileSweep(SG_TEST_PERIOD_MS);
+  }
+}
+
+void sortU16(uint16_t *v, uint8_t n) {
+  for (uint8_t i = 1; i < n; i++) {
+    const uint16_t key = v[i];
+    int j = (int)i - 1;
+    while (j >= 0 && v[j] > key) {
+      v[j + 1] = v[j];
+      j--;
+    }
+    v[j + 1] = key;
+  }
+}
+
+bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
+                 uint16_t &outMed, uint16_t &outMin, uint16_t &outMax) {
+  uint16_t tmp[SG_TEST_N];
+  uint8_t m = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    if (raw[i] != 0xFFFF) {
+      tmp[m++] = raw[i];
+    }
+  }
+  if (m == 0) {
+    Serial.print(label);
+    Serial.println(": no valid SG samples (UART?)");
+    outMed = outMin = outMax = 0;
+    return false;
+  }
+  sortU16(tmp, m);
+  outMin = tmp[0];
+  outMax = tmp[m - 1];
+  outMed = tmp[m / 2];
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < m; i++) {
+    sum += tmp[i];
+  }
+  Serial.print(label);
+  Serial.print(": n=");
+  Serial.print(m);
+  Serial.print("  min=");
+  Serial.print(outMin);
+  Serial.print("  med=");
+  Serial.print(outMed);
+  Serial.print("  avg=");
+  Serial.print(sum / m);
+  Serial.print("  max=");
+  Serial.println(outMax);
+  return true;
+}
+
+void fingerStallTest() {
+  if (!stepper) {
+    say("no stepper");
+    return;
+  }
+
+  if (!sweepEnabled) {
+    const int32_t amp = stepSize * 4 > 800 ? stepSize * 4 : 800;
+    startSweep(amp);
+  }
+  if (!sweepEnabled) {
+    return;
+  }
+
+  say("");
+  say("FINGER STALL TEST");
+  say("Hands OFF the shaft. Sampling free run...");
+  Serial.flush();
+  delayWhileSweep(400);
+
+  uint16_t freeBuf[SG_TEST_N];
+  uint16_t stallBuf[SG_TEST_N];
+  collectSg(freeBuf, SG_TEST_N);
+
+  say("");
+  say("NOW HOLD THE SHAFT so the motor cannot move.");
+  say("Sampling stall in:");
+  for (int i = 5; i >= 1; i--) {
+    Serial.print("  ");
+    Serial.println(i);
+    Serial.flush();
+    delayWhileSweep(1000);
+  }
+  say("Sampling WHILE you hold...");
+  Serial.flush();
+  collectSg(stallBuf, SG_TEST_N);
+
+  stopMotion();
+  say("Done — you can let go.");
+  say("");
+
+  uint16_t freeMed = 0, freeMin = 0, freeMax = 0;
+  uint16_t stallMed = 0, stallMin = 0, stallMax = 0;
+  const bool okFree = summarizeSg("FREE ", freeBuf, SG_TEST_N, freeMed, freeMin, freeMax);
+  const bool okStall = summarizeSg("STALL", stallBuf, SG_TEST_N, stallMed, stallMin, stallMax);
+  if (!okFree || !okStall) {
+    return;
+  }
+
+  Serial.print("drop (med) = ");
+  Serial.println((int)freeMed - (int)stallMed);
+
+  if (stallMed >= freeMed) {
+    say("No drop — StallGuard did not see the load. Try higher s/a, more current, or a harder hold.");
+    return;
+  }
+  if (freeMed < stallMed + 8) {
+    say("Drop is small — usable but noisy. Try higher speed/current.");
+  } else {
+    say("Clear drop — StallGuard sees the finger stall.");
+  }
+
+  const uint16_t trip = (uint16_t)((stallMed + freeMed) / 2);
+  uint16_t y = trip / 2;
+  if (y < 1) {
+    y = 1;
+  }
+  Serial.print("suggested y ");
+  Serial.print(y);
+  Serial.print("  (trip_below=");
+  Serial.print(2 * y);
+  Serial.println("). Set with y <n> if this looks right.");
 }
 
 int32_t clampToTravel(int32_t dest) {
@@ -227,7 +376,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps) {
     Serial.print(" pos=");
     Serial.println(stepper->getCurrentPosition());
 
-    if (sg != 0xFFFF && sg <= (uint16_t)sgThreshold) {
+    if (isStalled(sg)) {
       stalled = true;
       break;
     }
@@ -348,20 +497,25 @@ void processCommand(String cmd) {
     printStatus();
   } else if (c == 'z' || c == 'Z') {
     const uint16_t sg = readStallGuard();
+    const uint16_t trip = (uint16_t)(2 * sgThreshold);
     Serial.print("SG_RESULT=");
     Serial.print(sg);
     Serial.print("  SGTHRS=");
     Serial.print(sgThreshold);
-    Serial.print("  moving=");
-    Serial.print(stepper && stepper->isRunning() ? "yes" : "no");
-    Serial.print("  pos=");
-    Serial.println(stepper ? stepper->getCurrentPosition() : 0);
+    Serial.print("  trip_below=");
+    Serial.print(trip);
+    Serial.print("  stalled=");
+    Serial.println(isStalled(sg) ? "yes" : "no");
+  } else if (c == 'f' || c == 'F') {
+    fingerStallTest();
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
       setupStallGuard((uint8_t)v);
       Serial.print("SGTHRS=");
-      Serial.println(sgThreshold);
+      Serial.print(sgThreshold);
+      Serial.print("  trip_below=");
+      Serial.println(2 * sgThreshold);
     }
   } else if (c == 'w' || c == 'W') {
     if (sweepEnabled) {
