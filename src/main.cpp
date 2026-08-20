@@ -37,7 +37,7 @@ static const int32_t HOME_BACKOFF = 80;
 static const int32_t HOME_MAX_TRAVEL = 20000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
-static const uint8_t STALL_CONFIRM = 10;
+static const uint8_t STALL_CONFIRM = 3;
 static const uint32_t TCOOLTHRS_SETTING = 400;  // tune after measuring TSTEP at steady homing speed
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
