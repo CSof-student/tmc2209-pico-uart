@@ -38,6 +38,7 @@ static const int32_t HOME_MAX_TRAVEL = 20000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
 static const uint8_t STALL_CONFIRM = 10;
+static const uint32_t TCOOLTHRS_SETTING = 400;  // tune after measuring TSTEP at steady homing speed
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -70,7 +71,7 @@ void printHelp() {
   Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    f [steps] finger stall (two short extends)    y <0-255>    H home");
+  Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home");
 }
 
 void printStatus() {
@@ -84,6 +85,8 @@ void printStatus() {
   Serial.print(rmsMa);
   Serial.print("  SGTHRS=");
   Serial.print(sgThreshold);
+  Serial.print("  TCOOLTHRS=");
+  Serial.print(TCOOLTHRS_SETTING);
   Serial.print("  sweep=");
   Serial.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
@@ -112,7 +115,7 @@ void uartTest() {
 
 void setupStallGuard(uint8_t threshold) {
   sgThreshold = threshold;
-  driver.TCOOLTHRS(0xFFFFF);  // StallGuard active at homing/move speeds
+  driver.TCOOLTHRS(TCOOLTHRS_SETTING);  // StallGuard valid once TSTEP <= this threshold
   driver.SGTHRS(sgThreshold);
 }
 
@@ -122,6 +125,16 @@ uint16_t readStallGuard() {
     return 0xFFFF;
   }
   return sg;
+}
+
+uint32_t readTstep() {
+  return driver.TSTEP() & 0xFFFFF;
+}
+
+bool stallGuardVelocityValid(uint32_t tstep) {
+  // Smaller TSTEP = faster motor. Only trust StallGuard once the driver is
+  // at or above the configured minimum velocity.
+  return tstep > 0 && tstep <= TCOOLTHRS_SETTING;
 }
 
 // TMC2209: DIAG / stall when SG_RESULT < 2 * SGTHRS
@@ -434,19 +447,26 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
   uint16_t lastSg = 0xFFFF;
   bool stalled = false;
   while (stepper->isRunning()) {
+    const uint32_t tstep = readTstep();
     const uint16_t sg = readStallGuard();
     lastSg = sg;
     n++;
     const int32_t pos = stepper->getCurrentPosition();
-    const bool hit = isStalled(sg);
+
+    const bool velocityValid = stallGuardVelocityValid(tstep);
+    const bool hit = velocityValid && isStalled(sg);
     if (hit) {
       stallHits++;
     } else {
+      // This also clears any false low-speed hits while accelerating.
       stallHits = 0;
     }
 
     Serial.print("  n=");
     Serial.print(n);
+    Serial.print("  TSTEP=");
+    Serial.print(tstep);
+    Serial.print(velocityValid ? " SG_ON" : " SG_OFF");
     Serial.print("  sg=");
     if (sg == 0xFFFF) {
       Serial.print("UART?");
@@ -607,16 +627,29 @@ void processCommand(String cmd) {
   } else if (c == 'i' || c == 'I' || c == 'p' || c == 'P') {
     printStatus();
   } else if (c == 'z' || c == 'Z') {
+    const uint32_t tstep = readTstep();
     const uint16_t sg = readStallGuard();
     const uint16_t trip = (uint16_t)(2 * sgThreshold);
-    Serial.print("SG_RESULT=");
+    const bool velocityValid = stallGuardVelocityValid(tstep);
+    Serial.print("TSTEP=");
+    Serial.print(tstep);
+    Serial.print(velocityValid ? "  SG_ON" : "  SG_OFF");
+    Serial.print("  SG_RESULT=");
     Serial.print(sg);
     Serial.print("  SGTHRS=");
     Serial.print(sgThreshold);
     Serial.print("  trip_below=");
     Serial.print(trip);
     Serial.print("  stalled=");
-    Serial.println(isStalled(sg) ? "yes" : "no");
+    Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
+  } else if (c == 'v' || c == 'V') {
+    const uint32_t tstep = readTstep();
+    Serial.print("TSTEP=");
+    Serial.print(tstep);
+    Serial.print("  TCOOLTHRS=");
+    Serial.print(TCOOLTHRS_SETTING);
+    Serial.print("  StallGuard velocity gate=");
+    Serial.println(stallGuardVelocityValid(tstep) ? "ON" : "OFF");
   } else if (c == 'f' || c == 'F') {
     int32_t steps = FINGER_TEST_STEPS;
     if (cmd.length() > 1) {
