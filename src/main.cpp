@@ -9,7 +9,7 @@
     STEP GP3, DIR GP2, EN -> GND
     VIO 3.3V, VM motor PSU, GND common
 
-  Linear actuator: + retracts (toward 0), - extends (toward travelMax).
+  Linear actuator: + extends (out, toward travelMax), - retracts (in, toward 0).
   USB 115200.
 */
 
@@ -68,7 +68,7 @@ void printHelp() {
   Serial.println();
   Serial.println("Commands:");
   Serial.println("  h/? help     t UART test     i status     x stop");
-  Serial.println("  +/- nudge (+retract -extend)  n <steps>  s <Hz>  a <accel>  g <pos>");
+  Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home");
@@ -90,9 +90,9 @@ void printStatus() {
   Serial.print("  sweep=");
   Serial.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
-    Serial.print("  travel=0 (retract) .. ");
+    Serial.print("  travel=0 (in) .. ");
     Serial.print(travelMax);
-    Serial.println(" (extend)");
+    Serial.println(" (out)");
   } else {
     Serial.println("  travel not calibrated (run H)");
   }
@@ -307,14 +307,14 @@ bool startExtendBurst(int32_t steps) {
   }
 
   const int32_t pos = stepper->getCurrentPosition();
-  int32_t dest = pos - steps;  // extend on this wiring
+  int32_t dest = pos + steps;  // + / extend toward travelMax (out)
   if (travelCalibrated) {
-    const int32_t limit = travelMin + HOME_BACKOFF;
-    if (pos - limit < steps / 2) {
+    const int32_t limit = travelMax - HOME_BACKOFF;
+    if (limit - pos < steps / 2) {
       say("Not enough room to extend. Jog toward IN, then f again.");
       return false;
     }
-    if (dest < limit) {
+    if (dest > limit) {
       dest = limit;
     }
   }
@@ -414,7 +414,7 @@ int32_t clampToTravel(int32_t dest) {
   return dest;
 }
 
-// dirSign: -1 retract (toward 0 after home), +1 extend (toward travelMax)
+// dirSign is stepper counts. User '+'/out = +counts; user '-' /in = -counts.
 bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label) {
   if (!stepper || maxSteps <= 0) {
     return false;
@@ -519,7 +519,7 @@ void homeBothEnds() {
   }
   stopMotion();
 
-  say("StallGuard home (+retract / -extend)...");
+  say("StallGuard home (extend, then retract)...");
   setupStallGuard(sgThreshold);
   Serial.print("SGTHRS=");
   Serial.print(sgThreshold);
@@ -528,20 +528,7 @@ void homeBothEnds() {
   Serial.print(" Hz  accel=");
   Serial.println(HOME_ACCEL);
 
-  say("Seeking RETRACTED (+) ...");
-  if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT")) {
-    say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
-    travelCalibrated = false;
-    stepper->setSpeedInHz(moveSpeedHz);
-    stepper->setAcceleration(moveAccel);
-    return;
-  }
-  stepper->setCurrentPosition(0);
-  travelMin = 0;
-  say("Retracted end = 0");
-  delay(100);
-
-  say("Seeking EXTENDED (-) ...");
+  say("Seeking EXTENDED / OUT (+) ...");
   if (!moveUntilStall(+1, HOME_MAX_TRAVEL, "EXTEND")) {
     say("EXTEND: no stall — raise y or check mechanics");
     travelCalibrated = false;
@@ -549,21 +536,37 @@ void homeBothEnds() {
     stepper->setAcceleration(moveAccel);
     return;
   }
-  travelMax = stepper->getCurrentPosition();
-  if (travelMax < HOME_BACKOFF * 2) {
+  const int32_t extendPos = stepper->getCurrentPosition();
+  delay(100);
+
+  say("Seeking RETRACTED / IN (-) ...");
+  if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT")) {
+    say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
+    travelCalibrated = false;
+    stepper->setSpeedInHz(moveSpeedHz);
+    stepper->setAcceleration(moveAccel);
+    return;
+  }
+  const int32_t retractPos = stepper->getCurrentPosition();
+  const int32_t span = extendPos - retractPos;
+  if (span < HOME_BACKOFF * 2) {
     say("Travel too short — tune y / speed / current");
     travelCalibrated = false;
     stepper->setSpeedInHz(moveSpeedHz);
     stepper->setAcceleration(moveAccel);
     return;
   }
+  stepper->setCurrentPosition(0);
+  travelMin = 0;
+  travelMax = span;
   travelCalibrated = true;
-  Serial.print("Travel 0 (retract) .. ");
+  say("Retracted (in) end = 0");
+  Serial.print("Travel 0 (in) .. ");
   Serial.print(travelMax);
-  Serial.println(" (extend)");
+  Serial.println(" (out)");
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
-  say("Home done. +retracts -extends; g 0 / g <max>");
+  say("Home done. +extends -retracts; g 0 = in, g <max> = out");
 }
 
 void setupStepper() {
@@ -573,7 +576,8 @@ void setupStepper() {
     say("FastAccelStepper failed to claim STEP pin");
     return;
   }
-  stepper->setDirectionPin(DIR_PIN);
+  // Flip DIR so +counts = out (extend) and -counts = in (retract).
+  stepper->setDirectionPin(DIR_PIN, false);
   stepper->setEnablePin(ENABLE_PIN);
   stepper->setAutoEnable(true);
   stepper->setSpeedInHz(moveSpeedHz);
@@ -692,13 +696,13 @@ void processCommand(String cmd) {
     Serial.print("goto ");
     Serial.println(dest);
   } else if (c == '+' || c == '-') {
-    int32_t delta = (c == '+') ? -stepSize : stepSize;
+    int32_t delta = (c == '+') ? stepSize : -stepSize;
     if (cmd.length() > 1) {
       int32_t mag = cmd.substring(1).toInt();
       if (mag < 0) {
         mag = -mag;
       }
-      delta = (c == '+') ? -mag : mag;
+      delta = (c == '+') ? mag : -mag;
     }
     stopMotion();
     if (stepper) {
