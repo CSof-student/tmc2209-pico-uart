@@ -79,7 +79,7 @@ void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits) {
 void printHelp() {
   Serial.println();
   Serial.println("Commands:");
-  Serial.println("  h/? help     t UART test     i status     x stop");
+  Serial.println("  h/? help     t UART test     i status     x stop     0 set here as pos 0");
   Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
@@ -722,6 +722,26 @@ void processCommand(String cmd) {
     stepper->moveTo(dest);
     Serial.print("goto ");
     Serial.println(dest);
+  } else if (c == '0') {
+    if (!stepper) {
+      return;
+    }
+    stopMotion();
+    const int32_t here = stepper->getCurrentPosition();
+    if (travelCalibrated) {
+      travelMax -= here;
+      if (travelMax <= 0) {
+        travelCalibrated = false;
+        travelMax = 0;
+        say("travel limits cleared (new 0 is past old out)");
+      }
+    }
+    travelMin = 0;
+    stepper->setCurrentPosition(0);
+    Serial.print("zeroed here (was pos ");
+    Serial.print(here);
+    Serial.println(")");
+    printStatus();
   } else if (c == '+' || c == '-') {
     int32_t delta = (c == '+') ? stepSize : -stepSize;
     if (cmd.length() > 1) {
@@ -729,15 +749,13 @@ void processCommand(String cmd) {
       if (mag < 0) {
         mag = -mag;
       }
-      delta = (c == '+') ? mag : -mag;
+      if (mag > 0) {
+        delta = (c == '+') ? mag : -mag;
+      }
     }
     stopMotion();
     if (stepper) {
-      const int32_t dest = clampToTravel(stepper->getCurrentPosition() + delta);
-      delta = dest - stepper->getCurrentPosition();
-      if (delta != 0) {
-        stepper->move(delta);
-      }
+      stepper->move(delta);
     }
     Serial.print("move ");
     Serial.println(delta);
