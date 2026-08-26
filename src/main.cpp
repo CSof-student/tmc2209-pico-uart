@@ -64,6 +64,20 @@ void say(const char *msg) {
   Serial.flush();
 }
 
+// Teleplot / Serial Plotter line. Prefix '>' so Teleplot ignores the verbose log.
+void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits) {
+  Serial.print('>');
+  if (sg != 0xFFFF) {
+    Serial.print("sg:");
+    Serial.print(sg);
+    Serial.print(',');
+  }
+  Serial.print("trip:");
+  Serial.print(trip);
+  Serial.print(",hits:");
+  Serial.println(hits);
+}
+
 void printHelp() {
   Serial.println();
   Serial.println("Commands:");
@@ -72,6 +86,7 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home");
+  Serial.println("  H also streams >sg,trip,hits for Teleplot / Serial Plotter");
 }
 
 void printStatus() {
@@ -488,6 +503,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     Serial.print(STALL_CONFIRM);
     Serial.print("  pos=");
     Serial.println(pos);
+    plotHomeSample(sg, trip, stallHits);
 
     if (stallHits >= STALL_CONFIRM) {
       stalled = true;
@@ -531,6 +547,7 @@ void homeBothEnds() {
   stopMotion();
 
   say("StallGuard home (extend, then retract)...");
+  say("Plot: open Teleplot (or Serial Plotter) for sg vs trip while seeking");
   setupStallGuard(sgThreshold);
   Serial.print("SGTHRS=");
   Serial.print(sgThreshold);
