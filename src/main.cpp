@@ -64,17 +64,15 @@ void say(const char *msg) {
   Serial.flush();
 }
 
-// Teleplot / Serial Plotter line. Prefix '>' so Teleplot ignores the verbose log.
+// Teleplot serial format is one ">name:value" line per variable.
 void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits) {
-  Serial.print('>');
   if (sg != 0xFFFF) {
-    Serial.print("sg:");
-    Serial.print(sg);
-    Serial.print(',');
+    Serial.print(">sg:");
+    Serial.println(sg);
   }
-  Serial.print("trip:");
-  Serial.print(trip);
-  Serial.print(",hits:");
+  Serial.print(">trip:");
+  Serial.println(trip);
+  Serial.print(">hits:");
   Serial.println(hits);
 }
 
@@ -86,7 +84,7 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home");
-  Serial.println("  H also streams >sg,trip,hits for Teleplot / Serial Plotter");
+  Serial.println("  H also streams Teleplot lines: >sg:  >trip:  >hits:");
 }
 
 void printStatus() {
