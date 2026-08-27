@@ -29,15 +29,15 @@
 
 static const uint16_t DEFAULT_RMS_MA = 300;
 static const uint16_t DEFAULT_MICROSTEPS = 16;
-static const uint32_t DEFAULT_SPEED_HZ = 200;
+static const uint32_t DEFAULT_SPEED_HZ = 2500;
 static const uint32_t DEFAULT_ACCEL = 400;
-static const int32_t DEFAULT_STEP_SIZE = 200;
+static const int32_t DEFAULT_STEP_SIZE = 2000;
 
 static const int32_t HOME_BACKOFF = 80;
 static const int32_t HOME_MAX_TRAVEL = 35000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
-static const uint8_t STALL_CONFIRM = 5;
+static const uint8_t STALL_CONFIRM = 3;
 static const uint32_t TCOOLTHRS_SETTING = 400;  // tune after measuring TSTEP at steady homing speed
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
