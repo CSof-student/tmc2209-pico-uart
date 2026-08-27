@@ -83,7 +83,7 @@ void printHelp() {
   Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home");
+  Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home to 0");
   Serial.println("  H also streams Teleplot lines: >sg:  >trip:  >hits:");
 }
 
@@ -544,7 +544,7 @@ void homeBothEnds() {
   }
   stopMotion();
 
-  say("StallGuard home (extend, then retract)...");
+  say("StallGuard home to 0 (in / retract)...");
   say("Plot: open Teleplot (or Serial Plotter) for sg vs trip while seeking");
   setupStallGuard(sgThreshold);
   Serial.print("SGTHRS=");
@@ -553,17 +553,6 @@ void homeBothEnds() {
   Serial.print(HOME_SPEED_HZ);
   Serial.print(" Hz  accel=");
   Serial.println(HOME_ACCEL);
-
-  say("Seeking EXTENDED / OUT (+) ...");
-  int32_t extendHit = 0;
-  if (!moveUntilStall(+1, HOME_MAX_TRAVEL, "EXTEND", &extendHit)) {
-    say("EXTEND: no stall — raise y or check mechanics");
-    travelCalibrated = false;
-    stepper->setSpeedInHz(moveSpeedHz);
-    stepper->setAcceleration(moveAccel);
-    return;
-  }
-  delay(100);
 
   say("Seeking RETRACTED / IN (-) ...");
   int32_t retractHit = 0;
@@ -574,26 +563,15 @@ void homeBothEnds() {
     stepper->setAcceleration(moveAccel);
     return;
   }
-  const int32_t span = extendHit - retractHit;
-  if (span < HOME_BACKOFF * 2) {
-    say("Travel too short — tune y / speed / current");
-    travelCalibrated = false;
-    stepper->setSpeedInHz(moveSpeedHz);
-    stepper->setAcceleration(moveAccel);
-    return;
-  }
-  // Map first IN stall hit to 0; first OUT stall hit to travelMax.
+  // Map first IN stall hit to 0. No out-end seek.
   stepper->setCurrentPosition(stepper->getCurrentPosition() - retractHit);
   travelMin = 0;
-  travelMax = span;
-  travelCalibrated = true;
+  travelMax = 0;
+  travelCalibrated = false;
   say("Retracted (in) end = 0 (first stall hit)");
-  Serial.print("Travel 0 (in) .. ");
-  Serial.print(travelMax);
-  Serial.println(" (out)  [ends = first of 5 stall hits]");
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
-  say("Home done. +extends -retracts; g 0 = in, g <max> = out");
+  say("Home done. +extends -retracts; g 0 = in");
 }
 
 void setupStepper() {
