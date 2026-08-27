@@ -35,6 +35,7 @@ static const int32_t DEFAULT_STEP_SIZE = 2000;
 
 static const int32_t HOME_BACKOFF = 80;
 static const int32_t HOME_ZERO_JOG = 200;  // after IN stall, jog this far in (-) and call it 0
+static const int32_t HOME_ZERO_JOG_STEP = 10;
 static const uint32_t HOME_ZERO_JOG_SPEED_HZ = 300;
 static const uint32_t HOME_ZERO_JOG_ACCEL = 800;
 static const int32_t HOME_MAX_TRAVEL = 35000;
@@ -52,10 +53,11 @@ uint16_t rmsMa = DEFAULT_RMS_MA;
 uint16_t motor_microsteps = DEFAULT_MICROSTEPS;
 uint32_t moveSpeedHz = DEFAULT_SPEED_HZ;
 int32_t moveAccel = DEFAULT_ACCEL;
-uint8_t sgThreshold = 50;  // stall when SG_RESULT < 2 * SGTHRS; higher y = more sensitive
+uint8_t sgThreshold = 20;  // stall when SG_RESULT < 2 * SGTHRS; higher y = more sensitive
 bool travelCalibrated = false;
 int32_t travelMin = 0;
 int32_t travelMax = 0;
+bool originSet = false;
 bool sweepEnabled = false;
 int32_t sweepLo = 0;
 int32_t sweepHi = 0;
@@ -67,8 +69,13 @@ void say(const char *msg) {
   Serial.flush();
 }
 
+void plotPos(int32_t pos) {
+  Serial.print(">pos:");
+  Serial.println(pos);
+}
+
 // Teleplot serial format is one ">name:value" line per variable.
-void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits) {
+void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits, int32_t pos) {
   if (sg != 0xFFFF) {
     Serial.print(">sg:");
     Serial.println(sg);
@@ -77,6 +84,9 @@ void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits) {
   Serial.println(trip);
   Serial.print(">hits:");
   Serial.println(hits);
+  if (originSet) {
+    plotPos(pos);
+  }
 }
 
 void printHelp() {
@@ -87,7 +97,7 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home to 0");
-  Serial.println("  H also streams Teleplot lines: >sg:  >trip:  >hits:");
+  Serial.println("  H also streams Teleplot lines: >sg:  >trip:  >hits:  >pos: (after H)");
 }
 
 void printStatus() {
@@ -504,7 +514,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     Serial.print(STALL_CONFIRM);
     Serial.print("  pos=");
     Serial.println(pos);
-    plotHomeSample(sg, trip, stallHits);
+    plotHomeSample(sg, trip, stallHits, pos);
 
     if (stallHits >= STALL_CONFIRM) {
       stalled = true;
@@ -546,6 +556,7 @@ void homeBothEnds() {
     return;
   }
   stopMotion();
+  originSet = false;
 
   say("StallGuard home to 0 (in / retract)...");
   say("Plot: open Teleplot (or Serial Plotter) for sg vs trip while seeking");
@@ -562,25 +573,34 @@ void homeBothEnds() {
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT", &retractHit)) {
     say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
     travelCalibrated = false;
+    originSet = false;
     stepper->setSpeedInHz(moveSpeedHz);
     stepper->setAcceleration(moveAccel);
     return;
   }
-  // Map first IN stall hit to 0, then jog slowly in (-) and re-zero.
+  // Map first IN stall hit to 0, then jog slowly in (-) in small steps and re-zero.
   stepper->setCurrentPosition(stepper->getCurrentPosition() - retractHit);
   travelMin = 0;
   travelMax = 0;
   travelCalibrated = false;
+  originSet = true;
   Serial.print("stall in = 0; slow jog ");
   Serial.print(-HOME_ZERO_JOG);
-  Serial.print(" (in) at ");
+  Serial.print(" in steps of ");
+  Serial.print(HOME_ZERO_JOG_STEP);
+  Serial.print(" at ");
   Serial.print(HOME_ZERO_JOG_SPEED_HZ);
   Serial.println(" Hz then re-zero");
   stepper->setSpeedInHz(HOME_ZERO_JOG_SPEED_HZ);
   stepper->setAcceleration(HOME_ZERO_JOG_ACCEL);
-  stepper->move(-HOME_ZERO_JOG);
-  waitStepperIdle(4000);
+  for (int32_t left = HOME_ZERO_JOG; left > 0; left -= HOME_ZERO_JOG_STEP) {
+    const int32_t chunk = (left >= HOME_ZERO_JOG_STEP) ? HOME_ZERO_JOG_STEP : left;
+    stepper->move(-chunk);
+    waitStepperIdle(2000);
+    plotPos(stepper->getCurrentPosition());
+  }
   stepper->setCurrentPosition(0);
+  plotPos(0);
   say("Retracted (in) offset = 0");
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
@@ -729,6 +749,8 @@ void processCommand(String cmd) {
     }
     travelMin = 0;
     stepper->setCurrentPosition(0);
+    originSet = true;
+    plotPos(0);
     Serial.print("zeroed here (was pos ");
     Serial.print(here);
     Serial.println(")");
@@ -810,6 +832,15 @@ void setup() {
 
 void loop() {
   serviceSweep();
+
+  if (originSet && stepper && stepper->isRunning()) {
+    static uint32_t lastPosPlotMs = 0;
+    const uint32_t now = millis();
+    if (now - lastPosPlotMs >= 40) {
+      lastPosPlotMs = now;
+      plotPos(stepper->getCurrentPosition());
+    }
+  }
 
   while (Serial.available()) {
     const char ch = (char)Serial.read();
