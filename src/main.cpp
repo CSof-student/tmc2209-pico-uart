@@ -30,11 +30,13 @@
 static const uint16_t DEFAULT_RMS_MA = 300;
 static const uint16_t DEFAULT_MICROSTEPS = 16;
 static const uint32_t DEFAULT_SPEED_HZ = 2500;
-static const uint32_t DEFAULT_ACCEL = 400;
+static const uint32_t DEFAULT_ACCEL = 40000;
 static const int32_t DEFAULT_STEP_SIZE = 2000;
 
 static const int32_t HOME_BACKOFF = 80;
-static const int32_t HOME_ZERO_JOG = 100;  // after IN stall, jog this far in (-) and call it 0
+static const int32_t HOME_ZERO_JOG = 200;  // after IN stall, jog this far in (-) and call it 0
+static const uint32_t HOME_ZERO_JOG_SPEED_HZ = 300;
+static const uint32_t HOME_ZERO_JOG_ACCEL = 800;
 static const int32_t HOME_MAX_TRAVEL = 35000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
@@ -564,22 +566,25 @@ void homeBothEnds() {
     stepper->setAcceleration(moveAccel);
     return;
   }
-  // Map first IN stall hit to 0, then jog out and re-zero so 0 is off the stop.
+  // Map first IN stall hit to 0, then jog slowly in (-) and re-zero.
   stepper->setCurrentPosition(stepper->getCurrentPosition() - retractHit);
   travelMin = 0;
   travelMax = 0;
   travelCalibrated = false;
-  Serial.print("stall in = 0; jogging ");
+  Serial.print("stall in = 0; slow jog ");
   Serial.print(-HOME_ZERO_JOG);
-  Serial.println(" (in) then re-zero");
-  applyHomeMotion();
+  Serial.print(" (in) at ");
+  Serial.print(HOME_ZERO_JOG_SPEED_HZ);
+  Serial.println(" Hz then re-zero");
+  stepper->setSpeedInHz(HOME_ZERO_JOG_SPEED_HZ);
+  stepper->setAcceleration(HOME_ZERO_JOG_ACCEL);
   stepper->move(-HOME_ZERO_JOG);
-  waitStepperIdle(2000);
+  waitStepperIdle(4000);
   stepper->setCurrentPosition(0);
   say("Retracted (in) offset = 0");
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
-  say("Home done. +extends -retracts; g 0 = in (400 past stall)");
+  say("Home done. +extends -retracts; g 0 = in (offset past stall)");
 }
 
 void setupStepper() {
