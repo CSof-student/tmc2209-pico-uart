@@ -42,6 +42,8 @@ static const uint32_t HOME_ACCEL = 20000;
 static const uint8_t STALL_CONFIRM = 3;         // UART fallback only; DIAG trips on first pulse
 static const uint32_t TCOOLTHRS_SETTING = 400;  // chip pulses DIAG once TSTEP <= this
 static const uint32_t HOME_SG_PLOT_MS = 20;     // UART SG is for Teleplot only, not the trip
+// Accel to 2500 Hz at 20000 is ~156 steps; SG is still low for a bit after that.
+static const int32_t HOME_STALL_ARM_STEPS = 400;
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -497,21 +499,35 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   Serial.print("  speed=");
   Serial.print(HOME_SPEED_HZ);
   Serial.print(" accel=");
-  Serial.println(HOME_ACCEL);
+  Serial.print(HOME_ACCEL);
+  Serial.print("  arm_after=");
+  Serial.println(HOME_STALL_ARM_STEPS);
 
-  armDiag();
   stepper->move((int32_t)dirSign * maxSteps);
 
   uint16_t n = 0;
   uint8_t uartHits = 0;
   uint16_t lastSg = 0xFFFF;
   bool stalled = false;
+  bool diagArmed = false;
+  bool sgSeenHealthy = false;
   const char *source = nullptr;
   int32_t firstHitPos = 0;
   uint32_t lastPlotMs = 0;
 
   while (stepper->isRunning()) {
-    if (diagStallPulse) {
+    const int32_t posNow = stepper->getCurrentPosition();
+    const int32_t moved = (posNow > startPos) ? (posNow - startPos) : (startPos - posNow);
+
+    if (!diagArmed && moved >= HOME_STALL_ARM_STEPS) {
+      armDiag();
+      diagArmed = true;
+      Serial.print("  stall detect ON after ");
+      Serial.print(moved);
+      Serial.println(" steps");
+    }
+
+    if (diagArmed && diagStallPulse) {
       stopHere(&firstHitPos);
       stalled = true;
       source = "DIAG";
@@ -530,16 +546,19 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     n++;
     const int32_t pos = stepper->getCurrentPosition();
     const bool velocityValid = stallGuardVelocityValid(tstep);
-    const bool uartHit = velocityValid && isStalled(sg);
+    if (velocityValid && sg != 0xFFFF && sg >= trip) {
+      sgSeenHealthy = true;
+    }
+    const bool uartHit = diagArmed && sgSeenHealthy && velocityValid && isStalled(sg);
     if (uartHit) {
       uartHits++;
     } else {
       uartHits = 0;
     }
 
-    plotHomeSample(sg, trip, diagStallPulse || diagPinHigh() ? 1 : 0, pos);
+    plotHomeSample(sg, trip, (diagArmed && (diagStallPulse || diagPinHigh())) ? 1 : 0, pos);
 
-    if (diagStallPulse) {
+    if (diagArmed && diagStallPulse) {
       stopHere(&firstHitPos);
       stalled = true;
       source = "DIAG";
@@ -552,7 +571,9 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
       break;
     }
   }
-  disarmDiag();
+  if (diagArmed) {
+    disarmDiag();
+  }
 
   const int32_t endPos = stepper->getCurrentPosition();
   Serial.print("  samples=");
