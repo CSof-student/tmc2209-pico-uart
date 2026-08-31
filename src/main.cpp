@@ -36,10 +36,6 @@ static const uint32_t DEFAULT_ACCEL = 40000;
 static const int32_t DEFAULT_STEP_SIZE = 2000;
 
 static const int32_t HOME_BACKOFF = 80;
-static const int32_t HOME_ZERO_JOG = 200;  // after IN stall, jog this far in (-) and call it 0
-static const int32_t HOME_ZERO_JOG_STEP = 10;
-static const uint32_t HOME_ZERO_JOG_SPEED_HZ = 300;
-static const uint32_t HOME_ZERO_JOG_ACCEL = 800;
 static const int32_t HOME_MAX_TRAVEL = 35000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
@@ -476,7 +472,7 @@ static void stopHere(int32_t *posOut) {
 
 // dirSign is stepper counts. User '+'/out = +counts; user '-' /in = -counts.
 // Trip is DIAG (on-chip SG compare). UART SG is plotted only.
-// *firstStallPos is the stop position, not the later backoff.
+// *firstStallPos is the stall stop position.
 bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
                     int32_t *firstStallPos) {
   if (!stepper || maxSteps <= 0) {
@@ -574,11 +570,6 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     if (firstStallPos) {
       *firstStallPos = firstHitPos;
     }
-    applyHomeMotion();
-    stepper->move((int32_t)(-dirSign) * HOME_BACKOFF);
-    waitStepperIdle(1500);
-    Serial.print("  backoff to pos=");
-    Serial.println(stepper->getCurrentPosition());
   } else {
     Serial.println("NO STALL (hit max travel or stopped)");
     say("If DIAG never pulsed, check GP6 wiring. INDEX is not the stall pin.");
@@ -606,8 +597,7 @@ void homeBothEnds() {
   Serial.println(HOME_ACCEL);
 
   say("Seeking RETRACTED / IN (-) ...");
-  int32_t retractHit = 0;
-  if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT", &retractHit)) {
+  if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT", nullptr)) {
     say("RETRACT: no stall — raise y (more sensitive) or check mechanics");
     travelCalibrated = false;
     originSet = false;
@@ -615,33 +605,16 @@ void homeBothEnds() {
     stepper->setAcceleration(moveAccel);
     return;
   }
-  // Map first IN stall hit to 0, then jog slowly in (-) in small steps and re-zero.
-  stepper->setCurrentPosition(stepper->getCurrentPosition() - retractHit);
+  stepper->setCurrentPosition(0);
   travelMin = 0;
   travelMax = 0;
   travelCalibrated = false;
   originSet = true;
-  Serial.print("stall in = 0; slow jog ");
-  Serial.print(-HOME_ZERO_JOG);
-  Serial.print(" in steps of ");
-  Serial.print(HOME_ZERO_JOG_STEP);
-  Serial.print(" at ");
-  Serial.print(HOME_ZERO_JOG_SPEED_HZ);
-  Serial.println(" Hz then re-zero");
-  stepper->setSpeedInHz(HOME_ZERO_JOG_SPEED_HZ);
-  stepper->setAcceleration(HOME_ZERO_JOG_ACCEL);
-  for (int32_t left = HOME_ZERO_JOG; left > 0; left -= HOME_ZERO_JOG_STEP) {
-    const int32_t chunk = (left >= HOME_ZERO_JOG_STEP) ? HOME_ZERO_JOG_STEP : left;
-    stepper->move(-chunk);
-    waitStepperIdle(2000);
-    plotPos(stepper->getCurrentPosition());
-  }
-  stepper->setCurrentPosition(0);
   plotPos(0);
-  say("Retracted (in) offset = 0");
+  say("Retracted (in) = 0");
   stepper->setSpeedInHz(moveSpeedHz);
   stepper->setAcceleration(moveAccel);
-  say("Home done. +extends -retracts; g 0 = in (offset past stall)");
+  say("Home done. +extends -retracts; g 0 = stall end");
 }
 
 void setupStepper() {
