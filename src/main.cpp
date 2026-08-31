@@ -7,6 +7,7 @@
     GP8 --[1k]--+---- TMC UART
     GP9 --------+
     STEP GP3, DIR GP2, EN -> GND
+    DIAG GP6 (stall pulse; do not use INDEX)
     VIO 3.3V, VM motor PSU, GND common
 
   Linear actuator: + extends (out, toward travelMax), - retracts (in, toward 0).
@@ -20,6 +21,7 @@
 #define DIR_PIN    2
 #define STEP_PIN   3
 #define ENABLE_PIN -1
+#define DIAG_PIN   6
 #define TX_PIN     8
 #define RX_PIN     9
 
@@ -41,8 +43,9 @@ static const uint32_t HOME_ZERO_JOG_ACCEL = 800;
 static const int32_t HOME_MAX_TRAVEL = 35000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
-static const uint8_t STALL_CONFIRM = 3;
-static const uint32_t TCOOLTHRS_SETTING = 400;  // tune after measuring TSTEP at steady homing speed
+static const uint8_t STALL_CONFIRM = 3;         // UART fallback only; DIAG trips on first pulse
+static const uint32_t TCOOLTHRS_SETTING = 400;  // chip pulses DIAG once TSTEP <= this
+static const uint32_t HOME_SG_PLOT_MS = 20;     // UART SG is for Teleplot only, not the trip
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -64,6 +67,27 @@ int32_t sweepHi = 0;
 int32_t sweepTarget = 0;
 String line;
 
+// TMC2209 StallGuard4 compares SG_RESULT to 2*SGTHRS on-chip and pulses DIAG.
+// INDEX is a different output (electrical position) and cannot carry stall.
+volatile bool diagStallPulse = false;
+
+void diagIsr() {
+  diagStallPulse = true;
+}
+
+void armDiag() {
+  attachInterrupt(digitalPinToInterrupt(DIAG_PIN), diagIsr, RISING);
+  diagStallPulse = false;  // drop any edge caused by attach
+}
+
+void disarmDiag() {
+  detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
+}
+
+bool diagPinHigh() {
+  return digitalRead(DIAG_PIN) == HIGH;
+}
+
 void say(const char *msg) {
   Serial.println(msg);
   Serial.flush();
@@ -75,15 +99,15 @@ void plotPos(int32_t pos) {
 }
 
 // Teleplot serial format is one ">name:value" line per variable.
-void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t hits, int32_t pos) {
+void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t diag, int32_t pos) {
   if (sg != 0xFFFF) {
     Serial.print(">sg:");
     Serial.println(sg);
   }
+  Serial.print(">diag:");
+  Serial.println(diag);
   Serial.print(">trip:");
   Serial.println(trip);
-  Serial.print(">hits:");
-  Serial.println(hits);
   if (originSet) {
     plotPos(pos);
   }
@@ -96,8 +120,8 @@ void printHelp() {
   Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG read    v TSTEP read    f [steps] finger stall (two short extends)    y <0-255>    H home to 0");
-  Serial.println("  H also streams Teleplot lines: >sg:  >trip:  >hits:  >pos: (after H)");
+  Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>    H home to 0");
+  Serial.println("  H trips on DIAG (GP6), not UART. Teleplot: >sg:  >diag:  >trip:  >pos:");
 }
 
 void printStatus() {
@@ -113,6 +137,8 @@ void printStatus() {
   Serial.print(sgThreshold);
   Serial.print("  TCOOLTHRS=");
   Serial.print(TCOOLTHRS_SETTING);
+  Serial.print("  DIAG=");
+  Serial.print(diagPinHigh() ? "HIGH" : "LOW");
   Serial.print("  sweep=");
   Serial.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
@@ -440,9 +466,17 @@ int32_t clampToTravel(int32_t dest) {
   return dest;
 }
 
+static void stopHere(int32_t *posOut) {
+  const int32_t pos = stepper->getCurrentPosition();
+  stepper->forceStopAndNewPosition(pos);
+  if (posOut) {
+    *posOut = pos;
+  }
+}
+
 // dirSign is stepper counts. User '+'/out = +counts; user '-' /in = -counts.
-// On stall, *firstStallPos is the position of the first hit in the confirmed streak
-// (not the later stop/backoff position).
+// Trip is DIAG (on-chip SG compare). UART SG is plotted only.
+// *firstStallPos is the stop position, not the later backoff.
 bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
                     int32_t *firstStallPos) {
   if (!stepper || maxSteps <= 0) {
@@ -462,67 +496,67 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   Serial.print(sgThreshold);
   Serial.print("  trip_below=");
   Serial.print(trip);
-  Serial.print("  need ");
-  Serial.print(STALL_CONFIRM);
-  Serial.print(" in a row  speed=");
+  Serial.print("  DIAG=GP");
+  Serial.print(DIAG_PIN);
+  Serial.print("  speed=");
   Serial.print(HOME_SPEED_HZ);
   Serial.print(" accel=");
   Serial.println(HOME_ACCEL);
 
+  armDiag();
   stepper->move((int32_t)dirSign * maxSteps);
 
   uint16_t n = 0;
-  uint8_t stallHits = 0;
+  uint8_t uartHits = 0;
   uint16_t lastSg = 0xFFFF;
   bool stalled = false;
+  const char *source = nullptr;
   int32_t firstHitPos = 0;
+  uint32_t lastPlotMs = 0;
+
   while (stepper->isRunning()) {
+    if (diagStallPulse) {
+      stopHere(&firstHitPos);
+      stalled = true;
+      source = "DIAG";
+      break;
+    }
+
+    const uint32_t now = millis();
+    if (now - lastPlotMs < HOME_SG_PLOT_MS) {
+      continue;
+    }
+    lastPlotMs = now;
+
     const uint32_t tstep = readTstep();
     const uint16_t sg = readStallGuard();
     lastSg = sg;
     n++;
     const int32_t pos = stepper->getCurrentPosition();
-
     const bool velocityValid = stallGuardVelocityValid(tstep);
-    const bool hit = velocityValid && isStalled(sg);
-    if (hit) {
-      stallHits++;
-      if (stallHits == 1) {
-        firstHitPos = pos;
-      }
+    const bool uartHit = velocityValid && isStalled(sg);
+    if (uartHit) {
+      uartHits++;
     } else {
-      // This also clears any false low-speed hits while accelerating.
-      stallHits = 0;
+      uartHits = 0;
     }
 
-    Serial.print("  n=");
-    Serial.print(n);
-    Serial.print("  TSTEP=");
-    Serial.print(tstep);
-    Serial.print(velocityValid ? " SG_ON" : " SG_OFF");
-    Serial.print("  sg=");
-    if (sg == 0xFFFF) {
-      Serial.print("UART?");
-    } else {
-      Serial.print(sg);
-    }
-    Serial.print("  trip=");
-    Serial.print(trip);
-    Serial.print("  hits=");
-    Serial.print(stallHits);
-    Serial.print("/");
-    Serial.print(STALL_CONFIRM);
-    Serial.print("  pos=");
-    Serial.println(pos);
-    plotHomeSample(sg, trip, stallHits, pos);
+    plotHomeSample(sg, trip, diagStallPulse || diagPinHigh() ? 1 : 0, pos);
 
-    if (stallHits >= STALL_CONFIRM) {
+    if (diagStallPulse) {
+      stopHere(&firstHitPos);
       stalled = true;
-      stepper->forceStopAndNewPosition(pos);
+      source = "DIAG";
       break;
     }
-    delay(40);
+    if (uartHits >= STALL_CONFIRM) {
+      stopHere(&firstHitPos);
+      stalled = true;
+      source = "UART";
+      break;
+    }
   }
+  disarmDiag();
 
   const int32_t endPos = stepper->getCurrentPosition();
   Serial.print("  samples=");
@@ -533,7 +567,9 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   Serial.print(endPos - startPos);
   Serial.print("  -> ");
   if (stalled) {
-    Serial.print("STALL  first_hit pos=");
+    Serial.print("STALL ");
+    Serial.print(source);
+    Serial.print("  pos=");
     Serial.println(firstHitPos);
     if (firstStallPos) {
       *firstStallPos = firstHitPos;
@@ -545,6 +581,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     Serial.println(stepper->getCurrentPosition());
   } else {
     Serial.println("NO STALL (hit max travel or stopped)");
+    say("If DIAG never pulsed, check GP6 wiring. INDEX is not the stall pin.");
   }
 
   return stalled;
@@ -558,8 +595,8 @@ void homeBothEnds() {
   stopMotion();
   originSet = false;
 
-  say("StallGuard home to 0 (in / retract)...");
-  say("Plot: open Teleplot (or Serial Plotter) for sg vs trip while seeking");
+  say("StallGuard home to 0 (in / retract) — stop is DIAG on GP6");
+  say("Plot: Teleplot >sg: (UART, slow) and >diag: (hardware pulse)");
   setupStallGuard(sgThreshold);
   Serial.print("SGTHRS=");
   Serial.print(sgThreshold);
@@ -682,6 +719,8 @@ void processCommand(String cmd) {
     Serial.print(sgThreshold);
     Serial.print("  trip_below=");
     Serial.print(trip);
+    Serial.print("  DIAG=");
+    Serial.print(diagPinHigh() ? "HIGH" : "LOW");
     Serial.print("  stalled=");
     Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
   } else if (c == 'v' || c == 'V') {
@@ -821,13 +860,14 @@ void processCommand(String cmd) {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(DIAG_PIN, INPUT_PULLDOWN);
   delay(1500);
-  say("TMC2209 Serial2 UART + StallGuard (no auto-cycle)");
+  say("TMC2209 Serial2 UART + StallGuard (DIAG on GP6)");
 
   setupStepper();
   setupDriver();
   printHelp();
-  say("Setup complete. Tune z/y, then H.");
+  say("Setup complete. Wire DIAG to GP6, tune z/y, then H.");
 }
 
 void loop() {

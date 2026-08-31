@@ -9,6 +9,7 @@ Configure the TMC2209 over UART (current, microsteps), move it with STEP/DIR via
 | STEP | **GP3** | |
 | DIR | **GP2** | |
 | EN | **GND** | Active low. Or wire to a GPIO and set `ENABLE_PIN` in `src/main.cpp` |
+| DIAG | **GP6** | StallGuard pulse. Not INDEX, not VREF. |
 | PDN_UART | see UART below | Required for this project |
 | VIO / VCC | Pico **3.3V** | Logic |
 | GND | Pico GND + PSU GND | Common ground |
@@ -20,9 +21,9 @@ Configure the TMC2209 over UART (current, microsteps), move it with STEP/DIR via
 TMC2209 uses one UART wire (`PDN_UART`):
 
 ```
-Pico GP4 (TX) ----[ 1 kΩ ]----+---- TMC PDN_UART
+Pico GP8 (TX) ----[ 1 kΩ ]----+---- TMC PDN_UART
                               |
-Pico GP5 (RX) ----------------+
+Pico GP9 (RX) ----------------+
 ```
 
 - **1 kΩ** between TX and the shared node
@@ -69,11 +70,15 @@ Monitor baud: **115200**.
 | `m 16` | microsteps |
 | `t` | UART test |
 | `i` | status |
+| `z` | SG_RESULT + DIAG pin |
+| `y n` | StallGuard threshold (higher = more sensitive) |
+| `H` | home on DIAG stall |
 | `x` | stop |
 
 ## Notes
 
 - Current is set by **UART** (`rms_current`), not the pot.
 - Start low current on a NEMA 8; watch heat.
-- StallGuard / DIAG can be added later once UART + motion work.
+- StallGuard compare happens **on the TMC**. DIAG pulses when `SG_RESULT < 2 * SGTHRS`. Homing stops from that GPIO interrupt — not from USB, and not from INDEX.
+- UART `SG_RESULT` is still useful for Teleplot / `z` / `f`, but it is too slow to be the trip.
 - FastAccelStepper on Pico needs FreeRTOS (`-D__FREERTOS=1`) and Max Gerhardt’s platform (already in `platformio.ini`).
