@@ -44,6 +44,8 @@ static const uint32_t TCOOLTHRS_SETTING = 400;  // chip pulses DIAG once TSTEP <
 static const uint32_t HOME_SG_PLOT_MS = 20;     // UART SG is for Teleplot only, not the trip
 // Accel to 2500 Hz at 20000 is ~156 steps; SG is still low for a bit after that.
 static const int32_t HOME_STALL_ARM_STEPS = 400;
+static const uint8_t SG_CRUISE_WIN = 8;
+static const uint16_t SG_READY_MIN = 32;  // don't arm while StealthChop AT still has SG ~0
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -313,6 +315,18 @@ void sortU16(uint16_t *v, uint8_t n) {
   }
 }
 
+uint16_t medianU16(const uint16_t *v, uint8_t n) {
+  if (n == 0) {
+    return 0;
+  }
+  uint16_t tmp[SG_CRUISE_WIN];
+  for (uint8_t i = 0; i < n; i++) {
+    tmp[i] = v[i];
+  }
+  sortU16(tmp, n);
+  return tmp[n / 2];
+}
+
 bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
                  uint16_t &outMed, uint16_t &outMin, uint16_t &outMax) {
   uint16_t tmp[SG_TEST_N];
@@ -511,21 +525,17 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   bool stalled = false;
   bool diagArmed = false;
   bool sgSeenHealthy = false;
+  bool loggedWaiting = false;
   const char *source = nullptr;
   int32_t firstHitPos = 0;
   uint32_t lastPlotMs = 0;
+  uint16_t sgWin[SG_CRUISE_WIN];
+  uint8_t sgWinN = 0;
+  uint8_t sgWinI = 0;
 
   while (stepper->isRunning()) {
     const int32_t posNow = stepper->getCurrentPosition();
     const int32_t moved = (posNow > startPos) ? (posNow - startPos) : (startPos - posNow);
-
-    if (!diagArmed && moved >= HOME_STALL_ARM_STEPS) {
-      armDiag();
-      diagArmed = true;
-      Serial.print("  stall detect ON after ");
-      Serial.print(moved);
-      Serial.println(" steps");
-    }
 
     if (diagArmed && diagStallPulse) {
       stopHere(&firstHitPos);
@@ -546,7 +556,50 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     n++;
     const int32_t pos = stepper->getCurrentPosition();
     const bool velocityValid = stallGuardVelocityValid(tstep);
-    if (velocityValid && sg != 0xFFFF && sg >= trip) {
+
+    if (velocityValid && sg != 0xFFFF) {
+      sgWin[sgWinI] = sg;
+      sgWinI = (uint8_t)((sgWinI + 1) % SG_CRUISE_WIN);
+      if (sgWinN < SG_CRUISE_WIN) {
+        sgWinN++;
+      }
+    }
+
+    const uint16_t sgMed = medianU16(sgWin, sgWinN);
+    if (!diagArmed && moved >= HOME_STALL_ARM_STEPS && sgWinN >= 5) {
+      if (sgMed >= SG_READY_MIN) {
+        uint16_t autoY = sgMed / 4;
+        if (autoY < 1) {
+          autoY = 1;
+        }
+        if (autoY > 255) {
+          autoY = 255;
+        }
+        setupStallGuard((uint8_t)autoY);
+        armDiag();
+        diagArmed = true;
+        Serial.print("  stall detect ON  free_sg_med=");
+        Serial.print(sgMed);
+        Serial.print("  auto SGTHRS=");
+        Serial.print(sgThreshold);
+        Serial.print("  trip_below=");
+        Serial.print(2 * sgThreshold);
+        Serial.print("  pwm_ofs=");
+        Serial.print(driver.pwm_ofs_auto());
+        Serial.print("  pwm_grad=");
+        Serial.println(driver.pwm_grad_auto());
+      } else if (!loggedWaiting) {
+        loggedWaiting = true;
+        Serial.print("  waiting for StealthChop SG (med=");
+        Serial.print(sgMed);
+        Serial.print(" need>=");
+        Serial.print(SG_READY_MIN);
+        Serial.println(") — not arming yet");
+      }
+    }
+
+    const uint16_t tripNow = (uint16_t)(2 * sgThreshold);
+    if (velocityValid && sg != 0xFFFF && sg >= tripNow) {
       sgSeenHealthy = true;
     }
     const bool uartHit = diagArmed && sgSeenHealthy && velocityValid && isStalled(sg);
@@ -556,7 +609,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
       uartHits = 0;
     }
 
-    plotHomeSample(sg, trip, (diagArmed && (diagStallPulse || diagPinHigh())) ? 1 : 0, pos);
+    plotHomeSample(sg, tripNow, (diagArmed && (diagStallPulse || diagPinHigh())) ? 1 : 0, pos);
 
     if (diagArmed && diagStallPulse) {
       stopHere(&firstHitPos);
@@ -673,6 +726,7 @@ void setupDriver() {
   driver.mstep_reg_select(true);
   driver.microsteps(motor_microsteps);
   driver.pwm_autoscale(true);
+  driver.pwm_autograd(true);
   driver.TPWMTHRS(0);
   driver.semin(0);
   driver.en_spreadCycle(false);
@@ -715,6 +769,10 @@ void processCommand(String cmd) {
     Serial.print(trip);
     Serial.print("  DIAG=");
     Serial.print(diagPinHigh() ? "HIGH" : "LOW");
+    Serial.print("  pwm_ofs=");
+    Serial.print(driver.pwm_ofs_auto());
+    Serial.print("  pwm_grad=");
+    Serial.print(driver.pwm_grad_auto());
     Serial.print("  stalled=");
     Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
   } else if (c == 'v' || c == 'V') {
