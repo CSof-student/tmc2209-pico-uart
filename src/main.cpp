@@ -67,6 +67,9 @@ int32_t sweepLo = 0;
 int32_t sweepHi = 0;
 int32_t sweepTarget = 0;
 String line;
+bool stealthFrozen = false;
+uint8_t frozenOfs = 0;
+uint8_t frozenGrad = 0;
 
 // TMC2209 StallGuard4 compares SG_RESULT to 2*SGTHRS on-chip and pulses DIAG.
 // INDEX is a different output (electrical position) and cannot carry stall.
@@ -122,6 +125,7 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>    H home to 0");
+  Serial.println("  k freeze StealthChop (after moving)    K AUTO again");
   Serial.println("  H trips on DIAG (GP6), not UART. Teleplot: >sg:  >diag:  >trip:  >pos:");
 }
 
@@ -140,6 +144,15 @@ void printStatus() {
   Serial.print(TCOOLTHRS_SETTING);
   Serial.print("  DIAG=");
   Serial.print(diagPinHigh() ? "HIGH" : "LOW");
+  Serial.print("  stealth=");
+  if (stealthFrozen) {
+    Serial.print("FROZEN ofs=");
+    Serial.print(frozenOfs);
+    Serial.print(" grad=");
+    Serial.print(frozenGrad);
+  } else {
+    Serial.print("AUTO");
+  }
   Serial.print("  sweep=");
   Serial.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
@@ -170,6 +183,35 @@ void setupStallGuard(uint8_t threshold) {
   sgThreshold = threshold;
   driver.TCOOLTHRS(TCOOLTHRS_SETTING);  // StallGuard valid once TSTEP <= this threshold
   driver.SGTHRS(sgThreshold);
+}
+
+// Copy learned PWM_OFS/GRAD, stop gradient auto-tune. Keep pwm_autoscale so IRUN still limits current.
+bool freezeStealthChop() {
+  const uint8_t ofs = driver.pwm_ofs_auto();
+  const uint8_t grad = driver.pwm_grad_auto();
+  if (ofs == 0) {
+    say("freeze skip: pwm_ofs_auto=0 — move at speed first so AT can learn");
+    return false;
+  }
+  driver.pwm_ofs(ofs);
+  driver.pwm_grad(grad);
+  driver.pwm_autograd(false);
+  driver.pwm_autoscale(true);
+  stealthFrozen = true;
+  frozenOfs = ofs;
+  frozenGrad = grad;
+  Serial.print("StealthChop frozen  ofs=");
+  Serial.print(ofs);
+  Serial.print("  grad=");
+  Serial.println(grad);
+  return true;
+}
+
+void unfreezeStealthChop() {
+  driver.pwm_autoscale(true);
+  driver.pwm_autograd(true);
+  stealthFrozen = false;
+  say("StealthChop AUTO");
 }
 
 uint16_t readStallGuard() {
@@ -617,6 +659,9 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
         }
         freeSgMed = sgMed;
         tripHigh = (uint16_t)(hi + (hi / 6) + 10);
+        if (!stealthFrozen) {
+          freezeStealthChop();
+        }
         setupStallGuard((uint8_t)autoY);
         armDiag();
         diagArmed = true;
@@ -778,6 +823,8 @@ void setupDriver() {
   driver.microsteps(motor_microsteps);
   driver.pwm_autoscale(true);
   driver.pwm_autograd(true);
+  driver.pwm_reg(2);  // softer auto current loop — less SG wander
+  stealthFrozen = false;
   driver.TPWMTHRS(0);
   driver.semin(0);
   driver.en_spreadCycle(false);
@@ -824,6 +871,8 @@ void processCommand(String cmd) {
     Serial.print(driver.pwm_ofs_auto());
     Serial.print("  pwm_grad=");
     Serial.print(driver.pwm_grad_auto());
+    Serial.print("  stealth=");
+    Serial.print(stealthFrozen ? "FROZEN" : "AUTO");
     Serial.print("  stalled=");
     Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
   } else if (c == 'v' || c == 'V') {
@@ -834,6 +883,10 @@ void processCommand(String cmd) {
     Serial.print(TCOOLTHRS_SETTING);
     Serial.print("  StallGuard velocity gate=");
     Serial.println(stallGuardVelocityValid(tstep) ? "ON" : "OFF");
+  } else if (c == 'k') {
+    freezeStealthChop();
+  } else if (c == 'K') {
+    unfreezeStealthChop();
   } else if (c == 'f' || c == 'F') {
     int32_t steps = FINGER_TEST_STEPS;
     if (cmd.length() > 1) {
