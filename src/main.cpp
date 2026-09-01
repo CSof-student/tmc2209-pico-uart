@@ -48,6 +48,11 @@ static const uint8_t SG_CRUISE_WIN = 16;
 static const uint16_t SG_READY_MIN = 24;  // mean must be up; oscillation around it is fine
 static const uint8_t SG_MED_SETTLE = 5;   // consecutive similar medians (~100 ms)
 
+// After you read AUTO from `k`, paste here so the same PWM survives uploads. 0 = boot AUTO.
+static const uint8_t STEALTH_MANUAL_OFS = 0;
+static const uint8_t STEALTH_MANUAL_GRAD = 0;
+static const uint8_t PWM_OFS_MAX = 80;  // clamp; too high with autoscale off can over-current
+
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepper = nullptr;
@@ -125,7 +130,10 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>    H home to 0");
-  Serial.println("  k freeze StealthChop (after moving)    K AUTO again");
+  Serial.println("  k          print AUTO pwm_ofs / pwm_grad");
+  Serial.println("  k copy     lock those AUTO values (manual)");
+  Serial.println("  k <ofs> <grad>  lock those numbers (same each upload)");
+  Serial.println("  K          StealthChop AUTO again");
   Serial.println("  H trips on DIAG (GP6), not UART. Teleplot: >sg:  >diag:  >trip:  >pos:");
 }
 
@@ -146,12 +154,15 @@ void printStatus() {
   Serial.print(diagPinHigh() ? "HIGH" : "LOW");
   Serial.print("  stealth=");
   if (stealthFrozen) {
-    Serial.print("FROZEN ofs=");
+    Serial.print("MANUAL ofs=");
     Serial.print(frozenOfs);
     Serial.print(" grad=");
     Serial.print(frozenGrad);
   } else {
-    Serial.print("AUTO");
+    Serial.print("AUTO ofs=");
+    Serial.print(driver.pwm_ofs_auto());
+    Serial.print(" grad=");
+    Serial.print(driver.pwm_grad_auto());
   }
   Serial.print("  sweep=");
   Serial.println(sweepEnabled ? "on" : "off");
@@ -185,26 +196,54 @@ void setupStallGuard(uint8_t threshold) {
   driver.SGTHRS(sgThreshold);
 }
 
-// Copy learned PWM_OFS/GRAD, stop gradient auto-tune. Keep pwm_autoscale so IRUN still limits current.
-bool freezeStealthChop() {
-  const uint8_t ofs = driver.pwm_ofs_auto();
-  const uint8_t grad = driver.pwm_grad_auto();
-  if (ofs == 0) {
-    say("freeze skip: pwm_ofs_auto=0 — move at speed first so AT can learn");
+void unfreezeStealthChop();
+void stopMotion();
+
+bool applyManualStealth(uint8_t ofs, uint8_t grad) {
+  if (ofs > PWM_OFS_MAX) {
+    Serial.print("PWM_OFS ");
+    Serial.print(ofs);
+    Serial.print(" clamped to ");
+    Serial.println(PWM_OFS_MAX);
+    ofs = PWM_OFS_MAX;
+  }
+  if (ofs < 1) {
+    say("manual skip: ofs must be >= 1");
     return false;
   }
   driver.pwm_ofs(ofs);
   driver.pwm_grad(grad);
+  driver.pwm_autoscale(false);
   driver.pwm_autograd(false);
-  driver.pwm_autoscale(true);
   stealthFrozen = true;
   frozenOfs = ofs;
   frozenGrad = grad;
-  Serial.print("StealthChop frozen  ofs=");
+  Serial.print("StealthChop MANUAL  ofs=");
   Serial.print(ofs);
   Serial.print("  grad=");
   Serial.println(grad);
+  say("IRUN does not limit PWM; OT/short watchdog is on. K = AUTO");
   return true;
+}
+
+void printAutoPwm() {
+  Serial.print("AUTO pwm_ofs=");
+  Serial.print(driver.pwm_ofs_auto());
+  Serial.print("  pwm_grad=");
+  Serial.println(driver.pwm_grad_auto());
+  Serial.println("  k copy            lock these");
+  Serial.println("  k <ofs> <grad>    lock numbers (survives if you paste into STEALTH_MANUAL_OFS/GRAD)");
+}
+
+bool freezeStealthChop() {
+  const uint8_t ofs = driver.pwm_ofs_auto();
+  const uint8_t grad = driver.pwm_grad_auto();
+  if (ofs < 8) {
+    say("copy skip: pwm_ofs_auto still low — move at speed first");
+    printAutoPwm();
+    return false;
+  }
+  return applyManualStealth(ofs, grad);
 }
 
 void unfreezeStealthChop() {
@@ -212,6 +251,40 @@ void unfreezeStealthChop() {
   driver.pwm_autograd(true);
   stealthFrozen = false;
   say("StealthChop AUTO");
+}
+
+void serviceManualCurrentGuard() {
+  if (!stealthFrozen) {
+    return;
+  }
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (now - lastMs < 200) {
+    return;
+  }
+  lastMs = now;
+
+  const bool hot = driver.otpw() || driver.ot();
+  const bool shorted =
+      driver.s2ga() || driver.s2gb() || driver.s2vsa() || driver.s2vsb();
+  if (hot || shorted) {
+    unfreezeStealthChop();
+    stopMotion();
+    say(hot ? "OT — MANUAL off, AUTO + stop" : "short — MANUAL off, AUTO + stop");
+    return;
+  }
+
+  const uint16_t cs = driver.cs_actual();
+  if (cs >= 31) {
+    if (frozenOfs > 12) {
+      applyManualStealth((uint8_t)(frozenOfs - 4), frozenGrad);
+      say("cs_actual pegged — reduced PWM_OFS");
+    } else {
+      unfreezeStealthChop();
+      stopMotion();
+      say("cs_actual pegged — AUTO + stop");
+    }
+  }
 }
 
 uint16_t readStallGuard() {
@@ -659,9 +732,6 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
         }
         freeSgMed = sgMed;
         tripHigh = (uint16_t)(hi + (hi / 6) + 10);
-        if (!stealthFrozen) {
-          freezeStealthChop();
-        }
         setupStallGuard((uint8_t)autoY);
         armDiag();
         diagArmed = true;
@@ -834,6 +904,9 @@ void setupDriver() {
   setupStallGuard(sgThreshold);
 
   uartTest();
+  if (STEALTH_MANUAL_OFS != 0) {
+    applyManualStealth(STEALTH_MANUAL_OFS, STEALTH_MANUAL_GRAD);
+  }
 }
 
 void processCommand(String cmd) {
@@ -872,7 +945,7 @@ void processCommand(String cmd) {
     Serial.print("  pwm_grad=");
     Serial.print(driver.pwm_grad_auto());
     Serial.print("  stealth=");
-    Serial.print(stealthFrozen ? "FROZEN" : "AUTO");
+    Serial.print(stealthFrozen ? "MANUAL" : "AUTO");
     Serial.print("  stalled=");
     Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
   } else if (c == 'v' || c == 'V') {
@@ -884,7 +957,22 @@ void processCommand(String cmd) {
     Serial.print("  StallGuard velocity gate=");
     Serial.println(stallGuardVelocityValid(tstep) ? "ON" : "OFF");
   } else if (c == 'k') {
-    freezeStealthChop();
+    String rest = cmd.substring(1);
+    rest.trim();
+    if (rest.length() == 0) {
+      printAutoPwm();
+    } else if (rest == "copy" || rest == "COPY") {
+      freezeStealthChop();
+    } else {
+      int ofs = 0;
+      int grad = 0;
+      if (sscanf(rest.c_str(), "%d %d", &ofs, &grad) == 2 && ofs >= 0 && grad >= 0 &&
+          ofs <= 255 && grad <= 255) {
+        applyManualStealth((uint8_t)ofs, (uint8_t)grad);
+      } else {
+        say("usage: k | k copy | k <ofs> <grad>");
+      }
+    }
   } else if (c == 'K') {
     unfreezeStealthChop();
   } else if (c == 'f' || c == 'F') {
@@ -997,6 +1085,10 @@ void processCommand(String cmd) {
       driver.rms_current(rmsMa);
       Serial.print("rms_mA=");
       Serial.println(rmsMa);
+      if (stealthFrozen) {
+        unfreezeStealthChop();
+        say("current changed — StealthChop back to AUTO (re-learn, then k or H to lock)");
+      }
     }
   } else if (c == 'm' || c == 'M') {
     const int v = cmd.substring(1).toInt();
@@ -1028,6 +1120,7 @@ void setup() {
 
 void loop() {
   serviceSweep();
+  serviceManualCurrentGuard();
 
   if (originSet && stepper && stepper->isRunning()) {
     static uint32_t lastPosPlotMs = 0;
