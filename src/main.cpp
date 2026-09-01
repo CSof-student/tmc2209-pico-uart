@@ -44,8 +44,9 @@ static const uint32_t TCOOLTHRS_SETTING = 400;  // chip pulses DIAG once TSTEP <
 static const uint32_t HOME_SG_PLOT_MS = 20;     // UART SG is for Teleplot only, not the trip
 // Accel to 2500 Hz at 20000 is ~156 steps; SG is still low for a bit after that.
 static const int32_t HOME_STALL_ARM_STEPS = 400;
-static const uint8_t SG_CRUISE_WIN = 8;
-static const uint16_t SG_READY_MIN = 32;  // don't arm while StealthChop AT still has SG ~0
+static const uint8_t SG_CRUISE_WIN = 16;
+static const uint16_t SG_READY_MIN = 24;  // mean must be up; oscillation around it is fine
+static const uint8_t SG_MED_SETTLE = 5;   // consecutive similar medians (~100 ms)
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
 FastAccelStepperEngine engine = FastAccelStepperEngine();
@@ -327,6 +328,19 @@ uint16_t medianU16(const uint16_t *v, uint8_t n) {
   return tmp[n / 2];
 }
 
+void minMaxU16(const uint16_t *v, uint8_t n, uint16_t &outMin, uint16_t &outMax) {
+  outMin = v[0];
+  outMax = v[0];
+  for (uint8_t i = 1; i < n; i++) {
+    if (v[i] < outMin) {
+      outMin = v[i];
+    }
+    if (v[i] > outMax) {
+      outMax = v[i];
+    }
+  }
+}
+
 bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
                  uint16_t &outMed, uint16_t &outMin, uint16_t &outMax) {
   uint16_t tmp[SG_TEST_N];
@@ -532,6 +546,10 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   uint16_t sgWin[SG_CRUISE_WIN];
   uint8_t sgWinN = 0;
   uint8_t sgWinI = 0;
+  uint16_t freeSgMed = 0;
+  uint16_t tripHigh = 0;
+  uint16_t prevMed = 0;
+  uint8_t medSettleHits = 0;
 
   while (stepper->isRunning()) {
     const int32_t posNow = stepper->getCurrentPosition();
@@ -566,35 +584,65 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     }
 
     const uint16_t sgMed = medianU16(sgWin, sgWinN);
-    if (!diagArmed && moved >= HOME_STALL_ARM_STEPS && sgWinN >= 5) {
-      if (sgMed >= SG_READY_MIN) {
-        uint16_t autoY = sgMed / 4;
+    if (!diagArmed && moved >= HOME_STALL_ARM_STEPS && sgWinN >= SG_CRUISE_WIN &&
+        sgMed >= SG_READY_MIN) {
+      const uint16_t medTol = (uint16_t)(sgMed / 8 + 6);
+      const uint16_t medDiff = (prevMed > sgMed) ? (uint16_t)(prevMed - sgMed)
+                                                 : (uint16_t)(sgMed - prevMed);
+      if (prevMed != 0 && medDiff <= medTol) {
+        medSettleHits++;
+      } else {
+        medSettleHits = 0;
+      }
+      prevMed = sgMed;
+
+      uint16_t lo = 0, hi = 0;
+      minMaxU16(sgWin, sgWinN, lo, hi);
+
+      if (medSettleHits >= SG_MED_SETTLE) {
+        // Oscillation is normal. Trip outside the trough/peak envelope.
+        uint16_t tripLow = lo;
+        const uint16_t lowMargin = (uint16_t)((lo / 6) + 6);
+        if (tripLow > lowMargin) {
+          tripLow = (uint16_t)(tripLow - lowMargin);
+        } else {
+          tripLow = 1;
+        }
+        uint16_t autoY = tripLow / 2;
         if (autoY < 1) {
           autoY = 1;
         }
         if (autoY > 255) {
           autoY = 255;
         }
+        freeSgMed = sgMed;
+        tripHigh = (uint16_t)(hi + (hi / 6) + 10);
         setupStallGuard((uint8_t)autoY);
         armDiag();
         diagArmed = true;
-        Serial.print("  stall detect ON  free_sg_med=");
+        Serial.print("  stall detect ON  sg med=");
         Serial.print(sgMed);
-        Serial.print("  auto SGTHRS=");
-        Serial.print(sgThreshold);
+        Serial.print("  osc=");
+        Serial.print(lo);
+        Serial.print("..");
+        Serial.print(hi);
         Serial.print("  trip_below=");
         Serial.print(2 * sgThreshold);
+        Serial.print("  trip_above=");
+        Serial.print(tripHigh);
         Serial.print("  pwm_ofs=");
         Serial.print(driver.pwm_ofs_auto());
         Serial.print("  pwm_grad=");
         Serial.println(driver.pwm_grad_auto());
       } else if (!loggedWaiting) {
         loggedWaiting = true;
-        Serial.print("  waiting for StealthChop SG (med=");
+        Serial.print("  waiting for SG mean to settle (med=");
         Serial.print(sgMed);
-        Serial.print(" need>=");
-        Serial.print(SG_READY_MIN);
-        Serial.println(") — not arming yet");
+        Serial.print(" osc=");
+        Serial.print(lo);
+        Serial.print("..");
+        Serial.print(hi);
+        Serial.println(") — oscillation is OK");
       }
     }
 
@@ -602,7 +650,10 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     if (velocityValid && sg != 0xFFFF && sg >= tripNow) {
       sgSeenHealthy = true;
     }
-    const bool uartHit = diagArmed && sgSeenHealthy && velocityValid && isStalled(sg);
+    const bool dropHit = diagArmed && sgSeenHealthy && velocityValid && isStalled(sg);
+    const bool riseHit = diagArmed && velocityValid && sg != 0xFFFF && tripHigh > 0 &&
+                         sg > tripHigh;
+    const bool uartHit = dropHit || riseHit;
     if (uartHit) {
       uartHits++;
     } else {
@@ -620,7 +671,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     if (uartHits >= STALL_CONFIRM) {
       stopHere(&firstHitPos);
       stalled = true;
-      source = "UART";
+      source = riseHit ? "UART_UP" : "UART";
       break;
     }
   }
@@ -646,7 +697,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
     }
   } else {
     Serial.println("NO STALL (hit max travel or stopped)");
-    say("If DIAG never pulsed, check GP6 wiring. INDEX is not the stall pin.");
+    say("Hard end often raises SG (skipped steps), not a dip. Check trip_above vs the graph.");
   }
 
   return stalled;
