@@ -49,6 +49,8 @@ static const uint8_t SG_CRUISE_WIN = 16;
 static const uint16_t SG_READY_MIN = 24;  // mean must be up; oscillation around it is fine
 static const uint8_t SG_MED_SETTLE = 5;   // consecutive similar medians (~100 ms)
 
+
+// for speed sweep routine
 static const int32_t SG_SWEEP_STEPS = 8000;
 static const uint32_t SG_SWEEP_ACCEL = 20000;
 static const uint32_t SG_SWEEP_HZ_LO = 1400;
@@ -56,10 +58,11 @@ static const uint32_t SG_SWEEP_HZ_HI = 3000;
 static const uint32_t SG_SWEEP_HZ_STEP = 200;
 static const uint16_t SG_SWEEP_PERIOD_MS = 20;
 static const uint8_t SG_SWEEP_MAX_N = 200;
+static const uint8_t SG_SWEEP_MAX_SPEEDS = 16;
 
 // After you read AUTO from `k`, paste here so the same PWM survives uploads. 0 = boot AUTO.
-static const uint8_t STEALTH_MANUAL_OFS = 0;
-static const uint8_t STEALTH_MANUAL_GRAD = 0;
+static const uint8_t STEALTH_MANUAL_OFS = 80;
+static const uint8_t STEALTH_MANUAL_GRAD = 9;
 static const uint8_t PWM_OFS_MAX = 80;  // clamp; too high with autoscale off can over-current
 
 TMC2209Stepper driver(&TMC_SERIAL, R_SENSE, DRIVER_ADDRESS);
@@ -417,10 +420,6 @@ static uint8_t collectCruiseSg(int32_t moveSteps, uint32_t speedHz, uint32_t acc
     if (pos < cruise0 || pos > cruise1 || n >= maxN) {
       continue;
     }
-    const uint32_t tstep = readTstep();
-    if (!stallGuardVelocityValid(tstep)) {
-      continue;
-    }
     const uint16_t sg = readStallGuard();
     if (sg == 0xFFFF) {
       continue;
@@ -460,6 +459,34 @@ static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float 
   amp = (float)(outMax - outMin) * 0.5f;
 }
 
+// Re-send the whole curve so Teleplot's time window does not drop earlier speeds.
+static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp, uint8_t n) {
+  if (n == 0) {
+    return;
+  }
+  Serial.print(">sg_avg:");
+  for (uint8_t i = 0; i < n; i++) {
+    if (i) {
+      Serial.print(';');
+    }
+    Serial.print(hz[i]);
+    Serial.print(':');
+    Serial.print(avg[i], 1);
+  }
+  Serial.println("|xy,clr");
+
+  Serial.print(">sg_amp:");
+  for (uint8_t i = 0; i < n; i++) {
+    if (i) {
+      Serial.print(';');
+    }
+    Serial.print(hz[i]);
+    Serial.print(':');
+    Serial.print(amp[i], 1);
+  }
+  Serial.println("|xy,clr");
+}
+
 void sgSpeedSweep(int32_t moveSteps) {
   if (!stepper) {
     say("no stepper");
@@ -496,6 +523,11 @@ void sgSpeedSweep(int32_t moveSteps) {
   say("Teleplot: >sg_avg:Hz:mean|xy  and  >sg_amp:Hz:amp|xy   (x to abort)");
   Serial.println("speed_hz,sg_avg,sg_amp,n,min,max");
 
+  uint32_t hzOut[SG_SWEEP_MAX_SPEEDS];
+  float avgOut[SG_SWEEP_MAX_SPEEDS];
+  float ampOut[SG_SWEEP_MAX_SPEEDS];
+  uint8_t nOut = 0;
+
   bool aborted = false;
   for (uint32_t hz = SG_SWEEP_HZ_LO; hz <= SG_SWEEP_HZ_HI && !aborted;
        hz += SG_SWEEP_HZ_STEP) {
@@ -522,16 +554,13 @@ void sgSpeedSweep(int32_t moveSteps) {
     Serial.print(",");
     Serial.println(mx);
 
-    Serial.print(">sg_avg:");
-    Serial.print(hz);
-    Serial.print(":");
-    Serial.print(avg, 1);
-    Serial.println("|xy");
-    Serial.print(">sg_amp:");
-    Serial.print(hz);
-    Serial.print(":");
-    Serial.print(amp, 1);
-    Serial.println("|xy");
+    if (n > 0 && nOut < SG_SWEEP_MAX_SPEEDS) {
+      hzOut[nOut] = hz;
+      avgOut[nOut] = avg;
+      ampOut[nOut] = amp;
+      nOut++;
+      plotSgSweepXy(hzOut, avgOut, ampOut, nOut);
+    }
 
     stepper->setSpeedInHz(hz);
     stepper->setAcceleration((int32_t)SG_SWEEP_ACCEL);
@@ -543,6 +572,8 @@ void sgSpeedSweep(int32_t moveSteps) {
       break;
     }
   }
+
+  plotSgSweepXy(hzOut, avgOut, ampOut, nOut);
 
   stepper->moveTo(home);
   waitStepperIdle(20000);
