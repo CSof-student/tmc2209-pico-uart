@@ -29,7 +29,8 @@
 #define DRIVER_ADDRESS 0b00
 #define TMC_SERIAL Serial2
 
-static const uint16_t DEFAULT_RMS_MA = 300;
+static const uint16_t DEFAULT_RMS_MA = 400;
+static const float IHOLD_FRACTION = 1.0f;  // hold = run (400 mA both)
 static const uint16_t DEFAULT_MICROSTEPS = 16;
 static const uint32_t DEFAULT_SPEED_HZ = 2500;
 static const uint32_t DEFAULT_ACCEL = 40000;
@@ -47,6 +48,14 @@ static const int32_t HOME_STALL_ARM_STEPS = 400;
 static const uint8_t SG_CRUISE_WIN = 16;
 static const uint16_t SG_READY_MIN = 24;  // mean must be up; oscillation around it is fine
 static const uint8_t SG_MED_SETTLE = 5;   // consecutive similar medians (~100 ms)
+
+static const int32_t SG_SWEEP_STEPS = 8000;
+static const uint32_t SG_SWEEP_ACCEL = 20000;
+static const uint32_t SG_SWEEP_HZ_LO = 1400;
+static const uint32_t SG_SWEEP_HZ_HI = 3000;
+static const uint32_t SG_SWEEP_HZ_STEP = 200;
+static const uint16_t SG_SWEEP_PERIOD_MS = 20;
+static const uint8_t SG_SWEEP_MAX_N = 200;
 
 // After you read AUTO from `k`, paste here so the same PWM survives uploads. 0 = boot AUTO.
 static const uint8_t STEALTH_MANUAL_OFS = 0;
@@ -129,12 +138,13 @@ void printHelp() {
   Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>    H home to 0");
+  Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>");
+  Serial.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:");
+  Serial.println("  e [steps]  SG vs speed (AUTO, 1400-3000 Hz). Teleplot >sg_avg >sg_amp");
   Serial.println("  k          print AUTO pwm_ofs / pwm_grad");
   Serial.println("  k copy     lock those AUTO values (manual)");
   Serial.println("  k <ofs> <grad>  lock those numbers (same each upload)");
   Serial.println("  K          StealthChop AUTO again");
-  Serial.println("  H trips on DIAG (GP6), not UART. Teleplot: >sg:  >diag:  >trip:  >pos:");
 }
 
 void printStatus() {
@@ -341,6 +351,207 @@ void stopMotion() {
   if (stepper) {
     stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
   }
+}
+
+static bool pollAbortX() {
+  bool abort = false;
+  while (Serial.available()) {
+    const char ch = (char)Serial.read();
+    if (ch == 'x' || ch == 'X') {
+      abort = true;
+    }
+  }
+  return abort;
+}
+
+static uint32_t accelDistanceSteps(uint32_t speedHz, uint32_t accel) {
+  if (accel == 0) {
+    return 0;
+  }
+  return (speedHz * speedHz) / (2 * accel);
+}
+
+// Sample SG only on the constant-speed middle of a +move. Returns n.
+static uint8_t collectCruiseSg(int32_t moveSteps, uint32_t speedHz, uint32_t accel,
+                               uint16_t *buf, uint8_t maxN, bool &aborted) {
+  aborted = false;
+  uint8_t n = 0;
+  if (!stepper || moveSteps <= 0) {
+    return 0;
+  }
+
+  const int32_t start = stepper->getCurrentPosition();
+  const uint32_t ramp = accelDistanceSteps(speedHz, accel);
+  uint32_t startSkip = ramp + ramp / 4 + 80;
+  if (startSkip < (uint32_t)HOME_STALL_ARM_STEPS) {
+    startSkip = (uint32_t)HOME_STALL_ARM_STEPS;
+  }
+  const uint32_t endSkip = ramp + ramp / 4 + 80;
+  const int32_t cruise0 = start + (int32_t)startSkip;
+  const int32_t cruise1 = start + moveSteps - (int32_t)endSkip;
+  if (cruise1 <= cruise0) {
+    say("move too short for cruise SG at this speed");
+    return 0;
+  }
+
+  stepper->setSpeedInHz(speedHz);
+  stepper->setAcceleration((int32_t)accel);
+  stepper->move(moveSteps);
+
+  uint32_t lastMs = 0;
+  uint8_t settle = 0;
+  const uint32_t giveUp = millis() + 20000;
+  while (stepper->isRunning()) {
+    if (pollAbortX() || millis() > giveUp) {
+      aborted = true;
+      stopMotion();
+      break;
+    }
+    const uint32_t now = millis();
+    if (now - lastMs < SG_SWEEP_PERIOD_MS) {
+      delay(1);
+      continue;
+    }
+    lastMs = now;
+    const int32_t pos = stepper->getCurrentPosition();
+    if (pos < cruise0 || pos > cruise1 || n >= maxN) {
+      continue;
+    }
+    const uint32_t tstep = readTstep();
+    if (!stallGuardVelocityValid(tstep)) {
+      continue;
+    }
+    const uint16_t sg = readStallGuard();
+    if (sg == 0xFFFF) {
+      continue;
+    }
+    // Homing ignores the first samples after reaching speed.
+    if (settle < SG_MED_SETTLE) {
+      settle++;
+      continue;
+    }
+    buf[n++] = sg;
+  }
+  return n;
+}
+
+static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float &amp,
+                              uint16_t &outMin, uint16_t &outMax) {
+  avg = 0;
+  amp = 0;
+  outMin = 0;
+  outMax = 0;
+  if (n == 0) {
+    return;
+  }
+  uint32_t sum = 0;
+  outMin = buf[0];
+  outMax = buf[0];
+  for (uint8_t i = 0; i < n; i++) {
+    sum += buf[i];
+    if (buf[i] < outMin) {
+      outMin = buf[i];
+    }
+    if (buf[i] > outMax) {
+      outMax = buf[i];
+    }
+  }
+  avg = (float)sum / (float)n;
+  amp = (float)(outMax - outMin) * 0.5f;
+}
+
+void sgSpeedSweep(int32_t moveSteps) {
+  if (!stepper) {
+    say("no stepper");
+    return;
+  }
+  if (moveSteps < 1500) {
+    moveSteps = 1500;
+  }
+  stopMotion();
+
+  const bool wasManual = stealthFrozen;
+  const uint8_t saveOfs = frozenOfs;
+  const uint8_t saveGrad = frozenGrad;
+  if (wasManual) {
+    unfreezeStealthChop();
+  }
+
+  const uint32_t oldSpeed = moveSpeedHz;
+  const int32_t oldAccel = moveAccel;
+  const int32_t home = stepper->getCurrentPosition();
+
+  say("");
+  say("SG SPEED SWEEP  StealthChop AUTO");
+  Serial.print("extend ");
+  Serial.print(moveSteps);
+  Serial.print("  accel=");
+  Serial.print(SG_SWEEP_ACCEL);
+  Serial.print("  Hz ");
+  Serial.print(SG_SWEEP_HZ_LO);
+  Serial.print("..");
+  Serial.print(SG_SWEEP_HZ_HI);
+  Serial.print(" step ");
+  Serial.println(SG_SWEEP_HZ_STEP);
+  say("Teleplot: >sg_avg:Hz:mean|xy  and  >sg_amp:Hz:amp|xy   (x to abort)");
+  Serial.println("speed_hz,sg_avg,sg_amp,n,min,max");
+
+  bool aborted = false;
+  for (uint32_t hz = SG_SWEEP_HZ_LO; hz <= SG_SWEEP_HZ_HI && !aborted;
+       hz += SG_SWEEP_HZ_STEP) {
+    uint16_t buf[SG_SWEEP_MAX_N];
+    uint8_t n = collectCruiseSg(moveSteps, hz, SG_SWEEP_ACCEL, buf, SG_SWEEP_MAX_N, aborted);
+    if (aborted) {
+      say("aborted");
+      break;
+    }
+
+    float avg = 0, amp = 0;
+    uint16_t mn = 0, mx = 0;
+    summarizeCruiseSg(buf, n, avg, amp, mn, mx);
+
+    Serial.print(hz);
+    Serial.print(",");
+    Serial.print(avg, 1);
+    Serial.print(",");
+    Serial.print(amp, 1);
+    Serial.print(",");
+    Serial.print(n);
+    Serial.print(",");
+    Serial.print(mn);
+    Serial.print(",");
+    Serial.println(mx);
+
+    Serial.print(">sg_avg:");
+    Serial.print(hz);
+    Serial.print(":");
+    Serial.print(avg, 1);
+    Serial.println("|xy");
+    Serial.print(">sg_amp:");
+    Serial.print(hz);
+    Serial.print(":");
+    Serial.print(amp, 1);
+    Serial.println("|xy");
+
+    stepper->setSpeedInHz(hz);
+    stepper->setAcceleration((int32_t)SG_SWEEP_ACCEL);
+    stepper->moveTo(home);
+    waitStepperIdle(20000);
+    if (pollAbortX()) {
+      aborted = true;
+      say("aborted");
+      break;
+    }
+  }
+
+  stepper->moveTo(home);
+  waitStepperIdle(20000);
+  stepper->setSpeedInHz(oldSpeed);
+  stepper->setAcceleration(oldAccel);
+  if (wasManual) {
+    applyManualStealth(saveOfs, saveGrad);
+  }
+  say(aborted ? "SG sweep stopped" : "SG sweep done");
 }
 
 void serviceSweep() {
@@ -900,7 +1111,7 @@ void setupDriver() {
   driver.en_spreadCycle(false);
   driver.pdn_disable(true);
   driver.VACTUAL(0);
-  driver.rms_current(rmsMa);
+  driver.rms_current(rmsMa, IHOLD_FRACTION);
   setupStallGuard(sgThreshold);
 
   uartTest();
@@ -984,6 +1195,15 @@ void processCommand(String cmd) {
       }
     }
     fingerStallTest(steps);
+  } else if (c == 'e' || c == 'E') {
+    int32_t steps = SG_SWEEP_STEPS;
+    if (cmd.length() > 1) {
+      const int32_t v = cmd.substring(1).toInt();
+      if (v > 0) {
+        steps = v;
+      }
+    }
+    sgSpeedSweep(steps);
   } else if (c == 'y' || c == 'Y') {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
@@ -1082,7 +1302,7 @@ void processCommand(String cmd) {
     const int v = cmd.substring(1).toInt();
     if (v > 0 && v < 2000) {
       rmsMa = (uint16_t)v;
-      driver.rms_current(rmsMa);
+      driver.rms_current(rmsMa, IHOLD_FRACTION);
       Serial.print("rms_mA=");
       Serial.println(rmsMa);
       if (stealthFrozen) {
