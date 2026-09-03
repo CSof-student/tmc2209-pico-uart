@@ -374,24 +374,24 @@ static uint32_t accelDistanceSteps(uint32_t speedHz, uint32_t accel) {
   return (speedHz * speedHz) / (2 * accel);
 }
 
-// Sample SG only on the constant-speed middle of a +move. Returns n.
-static uint8_t collectCruiseSg(int32_t moveSteps, uint32_t speedHz, uint32_t accel,
-                               uint16_t *buf, uint8_t maxN, bool &aborted) {
+// Sample SG only on the constant-speed middle of a +move from fromPos. Returns n.
+static uint8_t collectCruiseSg(int32_t fromPos, int32_t moveSteps, uint32_t speedHz,
+                               uint32_t accel, uint16_t *buf, uint8_t maxN, bool &aborted) {
   aborted = false;
   uint8_t n = 0;
   if (!stepper || moveSteps <= 0) {
     return 0;
   }
 
-  const int32_t start = stepper->getCurrentPosition();
   const uint32_t ramp = accelDistanceSteps(speedHz, accel);
   uint32_t startSkip = ramp + ramp / 4 + 80;
   if (startSkip < (uint32_t)HOME_STALL_ARM_STEPS) {
     startSkip = (uint32_t)HOME_STALL_ARM_STEPS;
   }
   const uint32_t endSkip = ramp + ramp / 4 + 80;
-  const int32_t cruise0 = start + (int32_t)startSkip;
-  const int32_t cruise1 = start + moveSteps - (int32_t)endSkip;
+  const int32_t dest = fromPos + moveSteps;
+  const int32_t cruise0 = fromPos + (int32_t)startSkip;
+  const int32_t cruise1 = dest - (int32_t)endSkip;
   if (cruise1 <= cruise0) {
     say("move too short for cruise SG at this speed");
     return 0;
@@ -399,7 +399,7 @@ static uint8_t collectCruiseSg(int32_t moveSteps, uint32_t speedHz, uint32_t acc
 
   stepper->setSpeedInHz(speedHz);
   stepper->setAcceleration((int32_t)accel);
-  stepper->move(moveSteps);
+  stepper->moveTo(dest);
 
   uint32_t lastMs = 0;
   uint8_t settle = 0;
@@ -495,7 +495,15 @@ void sgSpeedSweep(int32_t moveSteps) {
   if (moveSteps < 1500) {
     moveSteps = 1500;
   }
-  stopMotion();
+
+  // Do not use stopMotion()/forceStopAndNewPosition here: on Pico that can
+  // rewrite the coordinate system to 0 (boot/home) while we still need the
+  // live e-start position.
+  sweepEnabled = false;
+  if (stepper->isRunning()) {
+    stepper->stopMove();
+    waitStepperIdle(10000);
+  }
 
   const bool wasManual = stealthFrozen;
   const uint8_t saveOfs = frozenOfs;
@@ -506,7 +514,7 @@ void sgSpeedSweep(int32_t moveSteps) {
 
   const uint32_t oldSpeed = moveSpeedHz;
   const int32_t oldAccel = moveAccel;
-  const int32_t home = stepper->getCurrentPosition();
+  const int32_t eStartPos = stepper->getCurrentPosition();
 
   say("");
   say("SG SPEED SWEEP  StealthChop AUTO");
@@ -520,6 +528,9 @@ void sgSpeedSweep(int32_t moveSteps) {
   Serial.print(SG_SWEEP_HZ_HI);
   Serial.print(" step ");
   Serial.println(SG_SWEEP_HZ_STEP);
+  Serial.print("return to e-start pos=");
+  Serial.print(eStartPos);
+  Serial.println(" after each speed (not 0/home)");
   say("Teleplot: >sg_avg:Hz:mean|xy  and  >sg_amp:Hz:amp|xy   (x to abort)");
   Serial.println("speed_hz,sg_avg,sg_amp,n,min,max");
 
@@ -532,7 +543,8 @@ void sgSpeedSweep(int32_t moveSteps) {
   for (uint32_t hz = SG_SWEEP_HZ_LO; hz <= SG_SWEEP_HZ_HI && !aborted;
        hz += SG_SWEEP_HZ_STEP) {
     uint16_t buf[SG_SWEEP_MAX_N];
-    uint8_t n = collectCruiseSg(moveSteps, hz, SG_SWEEP_ACCEL, buf, SG_SWEEP_MAX_N, aborted);
+    uint8_t n = collectCruiseSg(eStartPos, moveSteps, hz, SG_SWEEP_ACCEL, buf,
+                               SG_SWEEP_MAX_N, aborted);
     if (aborted) {
       say("aborted");
       break;
@@ -564,7 +576,7 @@ void sgSpeedSweep(int32_t moveSteps) {
 
     stepper->setSpeedInHz(hz);
     stepper->setAcceleration((int32_t)SG_SWEEP_ACCEL);
-    stepper->moveTo(home);
+    stepper->moveTo(eStartPos);
     waitStepperIdle(20000);
     if (pollAbortX()) {
       aborted = true;
@@ -575,7 +587,7 @@ void sgSpeedSweep(int32_t moveSteps) {
 
   plotSgSweepXy(hzOut, avgOut, ampOut, nOut);
 
-  stepper->moveTo(home);
+  stepper->moveTo(eStartPos);
   waitStepperIdle(20000);
   stepper->setSpeedInHz(oldSpeed);
   stepper->setAcceleration(oldAccel);
