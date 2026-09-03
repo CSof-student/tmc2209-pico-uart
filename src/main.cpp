@@ -59,6 +59,9 @@ static const uint32_t SG_SWEEP_HZ_STEP = 200;
 static const uint16_t SG_SWEEP_PERIOD_MS = 20;
 static const uint8_t SG_SWEEP_MAX_N = 200;
 static const uint8_t SG_SWEEP_MAX_SPEEDS = 16;
+static const uint8_t SG_SWEEP_RUNS = 8;
+
+uint8_t sgSweepRun = 0;
 
 // After you read AUTO from `k`, paste here so the same PWM survives uploads. 0 = boot AUTO.
 static const uint8_t STEALTH_MANUAL_OFS = 80;
@@ -143,7 +146,7 @@ void printHelp() {
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>");
   Serial.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:");
-  Serial.println("  e [steps]  SG vs speed (AUTO, 1400-3000 Hz). Teleplot >sg_avg >sg_amp");
+  Serial.println("  e [steps]  SG vs speed. Each run is a new Teleplot color (avg1..avg8)");
   Serial.println("  k          print AUTO pwm_ofs / pwm_grad");
   Serial.println("  k copy     lock those AUTO values (manual)");
   Serial.println("  k <ofs> <grad>  lock those numbers (same each upload)");
@@ -460,11 +463,15 @@ static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float 
 }
 
 // Re-send the whole curve so Teleplot's time window does not drop earlier speeds.
-static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp, uint8_t n) {
+// Unique names per run so Teleplot assigns a new color; comma groups them on one chart.
+static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp, uint8_t n,
+                          uint8_t run) {
   if (n == 0) {
     return;
   }
-  Serial.print(">sg_avg:");
+  Serial.print(">avg");
+  Serial.print(run);
+  Serial.print(",sg_avg:");
   for (uint8_t i = 0; i < n; i++) {
     if (i) {
       Serial.print(';');
@@ -475,7 +482,9 @@ static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp
   }
   Serial.println("|xy,clr");
 
-  Serial.print(">sg_amp:");
+  Serial.print(">amp");
+  Serial.print(run);
+  Serial.print(",sg_amp:");
   for (uint8_t i = 0; i < n; i++) {
     if (i) {
       Serial.print(';');
@@ -516,6 +525,11 @@ void sgSpeedSweep(int32_t moveSteps) {
   const int32_t oldAccel = moveAccel;
   const int32_t eStartPos = stepper->getCurrentPosition();
 
+  sgSweepRun++;
+  if (sgSweepRun > SG_SWEEP_RUNS) {
+    sgSweepRun = 1;
+  }
+
   say("");
   say("SG SPEED SWEEP  StealthChop AUTO");
   Serial.print("extend ");
@@ -530,8 +544,13 @@ void sgSpeedSweep(int32_t moveSteps) {
   Serial.println(SG_SWEEP_HZ_STEP);
   Serial.print("return to e-start pos=");
   Serial.print(eStartPos);
-  Serial.println(" after each speed (not 0/home)");
-  say("Teleplot: >sg_avg:Hz:mean|xy  and  >sg_amp:Hz:amp|xy   (x to abort)");
+  Serial.print("  Teleplot run ");
+  Serial.print(sgSweepRun);
+  Serial.print("  avg");
+  Serial.print(sgSweepRun);
+  Serial.print(" amp");
+  Serial.println(sgSweepRun);
+  say("Leave Teleplot open to overlay runs in different colors  (x to abort)");
   Serial.println("speed_hz,sg_avg,sg_amp,n,min,max");
 
   uint32_t hzOut[SG_SWEEP_MAX_SPEEDS];
@@ -571,7 +590,7 @@ void sgSpeedSweep(int32_t moveSteps) {
       avgOut[nOut] = avg;
       ampOut[nOut] = amp;
       nOut++;
-      plotSgSweepXy(hzOut, avgOut, ampOut, nOut);
+      plotSgSweepXy(hzOut, avgOut, ampOut, nOut, sgSweepRun);
     }
 
     stepper->setSpeedInHz(hz);
@@ -585,7 +604,7 @@ void sgSpeedSweep(int32_t moveSteps) {
     }
   }
 
-  plotSgSweepXy(hzOut, avgOut, ampOut, nOut);
+  plotSgSweepXy(hzOut, avgOut, ampOut, nOut, sgSweepRun);
 
   stepper->moveTo(eStartPos);
   waitStepperIdle(20000);
