@@ -7,7 +7,8 @@
     GP8 --[1k]--+---- TMC UART
     GP9 --------+
     STEP GP3, DIR GP2, EN -> GND
-    DIAG GP6 (stall pulse; do not use INDEX)
+    DIAG GP6 (stall pulse)
+    INDEX GP7 (electrical index; one pulse per 4 full steps)
     VIO 3.3V, VM motor PSU, GND common
 
   Linear actuator: + extends (out, toward travelMax), - retracts (in, toward 0).
@@ -22,6 +23,7 @@
 #define STEP_PIN   3
 #define ENABLE_PIN -1
 #define DIAG_PIN   6
+#define INDEX_PIN  7
 #define TX_PIN     8
 #define RX_PIN     9
 
@@ -36,7 +38,11 @@ static const uint32_t DEFAULT_SPEED_HZ = 2500;
 static const uint32_t DEFAULT_ACCEL = 40000;
 static const int32_t DEFAULT_STEP_SIZE = 2000;
 
+
+//not used in homing anymore, just used to protect ends in w/f command
 static const int32_t HOME_BACKOFF = 80;
+
+//homing stuff
 static const int32_t HOME_MAX_TRAVEL = 35000;
 static const uint32_t HOME_SPEED_HZ = 2500;
 static const uint32_t HOME_ACCEL = 20000;
@@ -92,37 +98,80 @@ uint8_t frozenOfs = 0;
 uint8_t frozenGrad = 0;
 
 // TMC2209 StallGuard4 compares SG_RESULT to 2*SGTHRS on-chip and pulses DIAG.
-// INDEX is a different output (electrical position) and cannot carry stall.
 volatile bool diagStallPulse = false;
+// INDEX pulse = one electrical rev = 4 full steps. DIR LOW = extend (+).
+volatile int32_t indexPos = 0;
+volatile int32_t indexStepSize = 4 * DEFAULT_MICROSTEPS;
 
+// Flag a DIAG rising edge (on-chip stall pulse).
 void diagIsr() {
   diagStallPulse = true;
 }
 
+// Enable the DIAG interrupt and drop the attach glitch.
 void armDiag() {
   attachInterrupt(digitalPinToInterrupt(DIAG_PIN), diagIsr, RISING);
   diagStallPulse = false;  // drop any edge caused by attach
 }
 
+// Disable the DIAG interrupt.
 void disarmDiag() {
   detachInterrupt(digitalPinToInterrupt(DIAG_PIN));
 }
 
+// Read whether DIAG is currently high.
 bool diagPinHigh() {
   return digitalRead(DIAG_PIN) == HIGH;
 }
 
+// Count one INDEX pulse in the current DIR as +/- 4 full steps (in microsteps).
+void indexIsr() {
+  if (digitalRead(DIR_PIN) == LOW) {
+    indexPos += indexStepSize;
+  } else {
+    indexPos -= indexStepSize;
+  }
+}
+
+// Set the INDEX-derived position (same units as stepper pos).
+void resetIndexPos(int32_t pos) {
+  noInterrupts();
+  indexPos = pos;
+  interrupts();
+}
+
+// Snapshot INDEX position for printing.
+int32_t readIndexPos() {
+  noInterrupts();
+  const int32_t p = indexPos;
+  interrupts();
+  return p;
+}
+
+// Wire INDEX on GP7 and start counting pulses.
+void setupIndex() {
+  pinMode(INDEX_PIN, INPUT_PULLDOWN);
+  indexStepSize = 4 * (int32_t)motor_microsteps;
+  resetIndexPos(0);
+  attachInterrupt(digitalPinToInterrupt(INDEX_PIN), indexIsr, RISING);
+}
+
+// Print a line and flush so it shows up immediately.
 void say(const char *msg) {
   Serial.println(msg);
   Serial.flush();
 }
 
+// Send stepper pos and INDEX-derived pos to Teleplot.
 void plotPos(int32_t pos) {
   Serial.print(">pos:");
   Serial.println(pos);
+  Serial.print(">ipos:");
+  Serial.println(readIndexPos());
 }
 
 // Teleplot serial format is one ">name:value" line per variable.
+// Plot one homing sample: SG, DIAG, trip threshold, and both positions.
 void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t diag, int32_t pos) {
   if (sg != 0xFFFF) {
     Serial.print(">sg:");
@@ -132,11 +181,10 @@ void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t diag, int32_t pos) {
   Serial.println(diag);
   Serial.print(">trip:");
   Serial.println(trip);
-  if (originSet) {
-    plotPos(pos);
-  }
+  plotPos(pos);
 }
 
+// Print the serial command list.
 void printHelp() {
   Serial.println();
   Serial.println("Commands:");
@@ -145,7 +193,7 @@ void printHelp() {
   Serial.println("  c <mA>  m <usteps>");
   Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
   Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>");
-  Serial.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:");
+  Serial.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:  >ipos:");
   Serial.println("  e [steps]  SG vs speed. Each run is a new Teleplot color (avg1..avg8)");
   Serial.println("  k          print AUTO pwm_ofs / pwm_grad");
   Serial.println("  k copy     lock those AUTO values (manual)");
@@ -153,9 +201,12 @@ void printHelp() {
   Serial.println("  K          StealthChop AUTO again");
 }
 
+// Print position, speed, current, StallGuard, and stealthchop state.
 void printStatus() {
   Serial.print("pos=");
   Serial.print(stepper ? stepper->getCurrentPosition() : 0);
+  Serial.print("  ipos=");
+  Serial.print(readIndexPos());
   Serial.print("  stepSize=");
   Serial.print(stepSize);
   Serial.print("  speedHz=");
@@ -191,6 +242,7 @@ void printStatus() {
   }
 }
 
+// Check TMC UART by reading connection status and chip version.
 void uartTest() {
   const uint8_t conn = driver.test_connection();
   Serial.print("test_connection = ");
@@ -206,6 +258,7 @@ void uartTest() {
   }
 }
 
+// Set SGTHRS and TCOOLTHRS so DIAG can pulse at cruise.
 void setupStallGuard(uint8_t threshold) {
   sgThreshold = threshold;
   driver.TCOOLTHRS(TCOOLTHRS_SETTING);  // StallGuard valid once TSTEP <= this threshold
@@ -215,6 +268,7 @@ void setupStallGuard(uint8_t threshold) {
 void unfreezeStealthChop();
 void stopMotion();
 
+// Lock StealthChop PWM_OFS/PWM_GRAD and turn autoscaling off.
 bool applyManualStealth(uint8_t ofs, uint8_t grad) {
   if (ofs > PWM_OFS_MAX) {
     Serial.print("PWM_OFS ");
@@ -242,6 +296,7 @@ bool applyManualStealth(uint8_t ofs, uint8_t grad) {
   return true;
 }
 
+// Print the AUTO-learned pwm_ofs and pwm_grad.
 void printAutoPwm() {
   Serial.print("AUTO pwm_ofs=");
   Serial.print(driver.pwm_ofs_auto());
@@ -251,6 +306,7 @@ void printAutoPwm() {
   Serial.println("  k <ofs> <grad>    lock numbers (survives if you paste into STEALTH_MANUAL_OFS/GRAD)");
 }
 
+// Copy current AUTO PWM values into MANUAL lock.
 bool freezeStealthChop() {
   const uint8_t ofs = driver.pwm_ofs_auto();
   const uint8_t grad = driver.pwm_grad_auto();
@@ -262,6 +318,7 @@ bool freezeStealthChop() {
   return applyManualStealth(ofs, grad);
 }
 
+// Turn StealthChop autoscale/autograd back on.
 void unfreezeStealthChop() {
   driver.pwm_autoscale(true);
   driver.pwm_autograd(true);
@@ -269,6 +326,7 @@ void unfreezeStealthChop() {
   say("StealthChop AUTO");
 }
 
+// Watchdog: if MANUAL overheats or pegs CS, drop back to AUTO.
 void serviceManualCurrentGuard() {
   if (!stealthFrozen) {
     return;
@@ -303,6 +361,7 @@ void serviceManualCurrentGuard() {
   }
 }
 
+// Read SG_RESULT over UART, or 0xFFFF on CRC error.
 uint16_t readStallGuard() {
   const uint16_t sg = driver.SG_RESULT() & 0x3FF;
   if (driver.CRCerror) {
@@ -311,10 +370,12 @@ uint16_t readStallGuard() {
   return sg;
 }
 
+// Read TSTEP (time between internal microsteps; smaller = faster).
 uint32_t readTstep() {
   return driver.TSTEP() & 0xFFFFF;
 }
 
+// True once TSTEP is in the TCOOLTHRS window (DIAG/SG trusted).
 bool stallGuardVelocityValid(uint32_t tstep) {
   // Smaller TSTEP = faster motor. Only trust StallGuard once the driver is
   // at or above the configured minimum velocity.
@@ -322,6 +383,7 @@ bool stallGuardVelocityValid(uint32_t tstep) {
 }
 
 // TMC2209: DIAG / stall when SG_RESULT < 2 * SGTHRS
+// UART stall test: SG_RESULT < 2*SGTHRS.
 bool isStalled(uint16_t sg) {
   if (sg == 0xFFFF) {
     return false;
@@ -329,6 +391,7 @@ bool isStalled(uint16_t sg) {
   return sg < (uint16_t)(2 * sgThreshold);
 }
 
+// Wait until the stepper stops, or force-stop on timeout.
 void waitStepperIdle(uint32_t timeoutMs = 2000) {
   if (!stepper) {
     return;
@@ -344,6 +407,7 @@ void waitStepperIdle(uint32_t timeoutMs = 2000) {
   }
 }
 
+// Set homing speed and acceleration.
 void applyHomeMotion() {
   if (!stepper) {
     return;
@@ -352,6 +416,7 @@ void applyHomeMotion() {
   stepper->setAcceleration(HOME_ACCEL);
 }
 
+// Cancel sweep and hard-stop the stepper at the current position.
 void stopMotion() {
   sweepEnabled = false;
   if (stepper) {
@@ -359,6 +424,7 @@ void stopMotion() {
   }
 }
 
+// Drain serial during a long move; true if the user sent x.
 static bool pollAbortX() {
   bool abort = false;
   while (Serial.available()) {
@@ -370,6 +436,7 @@ static bool pollAbortX() {
   return abort;
 }
 
+// Steps spent accelerating to speedHz at the given accel.
 static uint32_t accelDistanceSteps(uint32_t speedHz, uint32_t accel) {
   if (accel == 0) {
     return 0;
@@ -378,10 +445,14 @@ static uint32_t accelDistanceSteps(uint32_t speedHz, uint32_t accel) {
 }
 
 // Sample SG only on the constant-speed middle of a +move from fromPos. Returns n.
+// Extend from fromPos and sample SG only while at cruise. Returns sample count.
 static uint8_t collectCruiseSg(int32_t fromPos, int32_t moveSteps, uint32_t speedHz,
-                               uint32_t accel, uint16_t *buf, uint8_t maxN, bool &aborted) {
+                               uint32_t accel, uint16_t *buf, uint8_t maxN, bool &aborted,
+                               uint8_t *ofsOut, uint8_t *gradOut) {
   aborted = false;
   uint8_t n = 0;
+  uint8_t lastOfs = 0;
+  uint8_t lastGrad = 0;
   if (!stepper || moveSteps <= 0) {
     return 0;
   }
@@ -420,6 +491,7 @@ static uint8_t collectCruiseSg(int32_t fromPos, int32_t moveSteps, uint32_t spee
     }
     lastMs = now;
     const int32_t pos = stepper->getCurrentPosition();
+    plotPos(pos);
     if (pos < cruise0 || pos > cruise1 || n >= maxN) {
       continue;
     }
@@ -433,10 +505,19 @@ static uint8_t collectCruiseSg(int32_t fromPos, int32_t moveSteps, uint32_t spee
       continue;
     }
     buf[n++] = sg;
+    lastOfs = driver.pwm_ofs_auto();
+    lastGrad = driver.pwm_grad_auto();
+  }
+  if (ofsOut) {
+    *ofsOut = lastOfs;
+  }
+  if (gradOut) {
+    *gradOut = lastGrad;
   }
   return n;
 }
 
+// Compute mean SG and (max-min)/2 amplitude from cruise samples.
 static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float &amp,
                               uint16_t &outMin, uint16_t &outMax) {
   avg = 0;
@@ -462,40 +543,39 @@ static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float 
   amp = (float)(outMax - outMin) * 0.5f;
 }
 
-// Re-send the whole curve so Teleplot's time window does not drop earlier speeds.
-// Unique names per run so Teleplot assigns a new color; comma groups them on one chart.
-static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp, uint8_t n,
-                          uint8_t run) {
-  if (n == 0) {
-    return;
-  }
-  Serial.print(">avg");
+// Print one Teleplot XY series for the current e-run.
+static void printSweepXy(const char *prefix, uint8_t run, const char *widget,
+                         const uint32_t *hz, const float *y, uint8_t n, uint8_t decimals) {
+  Serial.print('>');
+  Serial.print(prefix);
   Serial.print(run);
-  Serial.print(",sg_avg:");
+  Serial.print(',');
+  Serial.print(widget);
+  Serial.print(':');
   for (uint8_t i = 0; i < n; i++) {
     if (i) {
       Serial.print(';');
     }
     Serial.print(hz[i]);
     Serial.print(':');
-    Serial.print(avg[i], 1);
-  }
-  Serial.println("|xy,clr");
-
-  Serial.print(">amp");
-  Serial.print(run);
-  Serial.print(",sg_amp:");
-  for (uint8_t i = 0; i < n; i++) {
-    if (i) {
-      Serial.print(';');
-    }
-    Serial.print(hz[i]);
-    Serial.print(':');
-    Serial.print(amp[i], 1);
+    Serial.print(y[i], decimals);
   }
   Serial.println("|xy,clr");
 }
 
+// Dump speed vs SG and AUTO pwm_ofs/pwm_grad for this e-run to Teleplot.
+static void plotSgSweepXy(const uint32_t *hz, const float *avg, const float *amp,
+                          const float *ofs, const float *grad, uint8_t n, uint8_t run) {
+  if (n == 0) {
+    return;
+  }
+  printSweepXy("avg", run, "sg_avg", hz, avg, n, 1);
+  printSweepXy("amp", run, "sg_amp", hz, amp, n, 1);
+  printSweepXy("ofs", run, "pwm_ofs", hz, ofs, n, 0);
+  printSweepXy("grd", run, "pwm_grad", hz, grad, n, 0);
+}
+
+// Run the speed sweep: extend, sample cruise SG, return, next speed.
 void sgSpeedSweep(int32_t moveSteps) {
   if (!stepper) {
     say("no stepper");
@@ -551,19 +631,23 @@ void sgSpeedSweep(int32_t moveSteps) {
   Serial.print(" amp");
   Serial.println(sgSweepRun);
   say("Leave Teleplot open to overlay runs in different colors  (x to abort)");
-  Serial.println("speed_hz,sg_avg,sg_amp,n,min,max");
+  Serial.println("speed_hz,sg_avg,sg_amp,n,min,max,pwm_ofs,pwm_grad");
 
   uint32_t hzOut[SG_SWEEP_MAX_SPEEDS];
   float avgOut[SG_SWEEP_MAX_SPEEDS];
   float ampOut[SG_SWEEP_MAX_SPEEDS];
+  float ofsOut[SG_SWEEP_MAX_SPEEDS];
+  float gradOut[SG_SWEEP_MAX_SPEEDS];
   uint8_t nOut = 0;
 
   bool aborted = false;
   for (uint32_t hz = SG_SWEEP_HZ_LO; hz <= SG_SWEEP_HZ_HI && !aborted;
        hz += SG_SWEEP_HZ_STEP) {
     uint16_t buf[SG_SWEEP_MAX_N];
+    uint8_t pwmOfs = 0;
+    uint8_t pwmGrad = 0;
     uint8_t n = collectCruiseSg(eStartPos, moveSteps, hz, SG_SWEEP_ACCEL, buf,
-                               SG_SWEEP_MAX_N, aborted);
+                               SG_SWEEP_MAX_N, aborted, &pwmOfs, &pwmGrad);
     if (aborted) {
       say("aborted");
       break;
@@ -583,14 +667,20 @@ void sgSpeedSweep(int32_t moveSteps) {
     Serial.print(",");
     Serial.print(mn);
     Serial.print(",");
-    Serial.println(mx);
+    Serial.print(mx);
+    Serial.print(",");
+    Serial.print(pwmOfs);
+    Serial.print(",");
+    Serial.println(pwmGrad);
 
     if (n > 0 && nOut < SG_SWEEP_MAX_SPEEDS) {
       hzOut[nOut] = hz;
       avgOut[nOut] = avg;
       ampOut[nOut] = amp;
+      ofsOut[nOut] = (float)pwmOfs;
+      gradOut[nOut] = (float)pwmGrad;
       nOut++;
-      plotSgSweepXy(hzOut, avgOut, ampOut, nOut, sgSweepRun);
+      plotSgSweepXy(hzOut, avgOut, ampOut, ofsOut, gradOut, nOut, sgSweepRun);
     }
 
     stepper->setSpeedInHz(hz);
@@ -604,7 +694,7 @@ void sgSpeedSweep(int32_t moveSteps) {
     }
   }
 
-  plotSgSweepXy(hzOut, avgOut, ampOut, nOut, sgSweepRun);
+  plotSgSweepXy(hzOut, avgOut, ampOut, ofsOut, gradOut, nOut, sgSweepRun);
 
   stepper->moveTo(eStartPos);
   waitStepperIdle(20000);
@@ -616,6 +706,7 @@ void sgSpeedSweep(int32_t moveSteps) {
   say(aborted ? "SG sweep stopped" : "SG sweep done");
 }
 
+// If w-sweep is on and idle, start the next leg.
 void serviceSweep() {
   if (!sweepEnabled || !stepper || stepper->isRunning()) {
     return;
@@ -624,6 +715,7 @@ void serviceSweep() {
   stepper->moveTo(sweepTarget);
 }
 
+// Start back-and-forth motion between two positions.
 void startSweep(int32_t amplitude) {
   if (!stepper) {
     say("no stepper");
@@ -671,6 +763,7 @@ static const uint8_t SG_TEST_N = 20;
 static const uint16_t SG_TEST_PERIOD_MS = 50;
 static const int32_t FINGER_TEST_STEPS = 1800;
 
+// Delay in small chunks so the serial buffer can drain.
 void delayMs(uint32_t ms) {
   const uint32_t t0 = millis();
   while (millis() - t0 < ms) {
@@ -678,6 +771,7 @@ void delayMs(uint32_t ms) {
   }
 }
 
+// Sample SG on a timer while the motor is moving.
 uint8_t collectSgWhileMoving(uint16_t *buf, uint8_t maxN) {
   uint8_t n = 0;
   const uint32_t giveUp = millis() + 2500;
@@ -692,6 +786,7 @@ uint8_t collectSgWhileMoving(uint16_t *buf, uint8_t maxN) {
   return n;
 }
 
+// In-place insertion sort of a small uint16 array.
 void sortU16(uint16_t *v, uint8_t n) {
   for (uint8_t i = 1; i < n; i++) {
     const uint16_t key = v[i];
@@ -704,6 +799,7 @@ void sortU16(uint16_t *v, uint8_t n) {
   }
 }
 
+// Median of up to SG_CRUISE_WIN samples.
 uint16_t medianU16(const uint16_t *v, uint8_t n) {
   if (n == 0) {
     return 0;
@@ -716,6 +812,7 @@ uint16_t medianU16(const uint16_t *v, uint8_t n) {
   return tmp[n / 2];
 }
 
+// Min and max of a uint16 array.
 void minMaxU16(const uint16_t *v, uint8_t n, uint16_t &outMin, uint16_t &outMax) {
   outMin = v[0];
   outMax = v[0];
@@ -729,6 +826,7 @@ void minMaxU16(const uint16_t *v, uint8_t n, uint16_t &outMin, uint16_t &outMax)
   }
 }
 
+// Print min/med/avg/max SG for a finger-test burst.
 bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
                  uint16_t &outMed, uint16_t &outMin, uint16_t &outMax) {
   uint16_t tmp[SG_TEST_N];
@@ -766,6 +864,7 @@ bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
   return true;
 }
 
+// Start a short +extend; stay off travelMax if limits exist.
 bool startExtendBurst(int32_t steps) {
   stopMotion();
   if (steps < 200) {
@@ -792,6 +891,7 @@ bool startExtendBurst(int32_t steps) {
   return true;
 }
 
+// Compare free vs held SG on two short extends and suggest y.
 void fingerStallTest(int32_t steps) {
   if (!stepper) {
     say("no stepper");
@@ -867,6 +967,7 @@ void fingerStallTest(int32_t steps) {
   Serial.println("). Set with y <n> if this looks right.");
 }
 
+// Clamp a goto target to calibrated travel, if any.
 int32_t clampToTravel(int32_t dest) {
   if (!travelCalibrated) {
     return dest;
@@ -880,6 +981,7 @@ int32_t clampToTravel(int32_t dest) {
   return dest;
 }
 
+// Hard-stop now and optionally return that position.
 static void stopHere(int32_t *posOut) {
   const int32_t pos = stepper->getCurrentPosition();
   stepper->forceStopAndNewPosition(pos);
@@ -891,6 +993,7 @@ static void stopHere(int32_t *posOut) {
 // dirSign is stepper counts. User '+'/out = +counts; user '-' /in = -counts.
 // Trip is DIAG (on-chip SG compare). UART SG is plotted only.
 // *firstStallPos is the stall stop position.
+// Move until DIAG/UART stall, plotting SG along the way.
 bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
                     int32_t *firstStallPos) {
   if (!stepper || maxSteps <= 0) {
@@ -1091,6 +1194,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   return stalled;
 }
 
+// Retract until stall and call that position 0.
 void homeBothEnds() {
   if (!stepper) {
     say("no stepper");
@@ -1119,6 +1223,7 @@ void homeBothEnds() {
     return;
   }
   stepper->setCurrentPosition(0);
+  resetIndexPos(0);
   travelMin = 0;
   travelMax = 0;
   travelCalibrated = false;
@@ -1130,6 +1235,7 @@ void homeBothEnds() {
   say("Home done. +extends -retracts; g 0 = stall end");
 }
 
+// Init FastAccelStepper on STEP/DIR.
 void setupStepper() {
   engine.init();
   stepper = engine.stepperConnectToPin(STEP_PIN);
@@ -1147,6 +1253,7 @@ void setupStepper() {
   say("Stepper ready");
 }
 
+// Init TMC UART, current, StealthChop, and StallGuard.
 void setupDriver() {
   TMC_SERIAL.setPollingMode(true);
   if (!TMC_SERIAL.setTX(TX_PIN) || !TMC_SERIAL.setRX(RX_PIN)) {
@@ -1172,6 +1279,8 @@ void setupDriver() {
   driver.semin(0);
   driver.en_spreadCycle(false);
   driver.pdn_disable(true);
+  driver.index_otpw(false);
+  driver.index_step(false);
   driver.VACTUAL(0);
   driver.rms_current(rmsMa, IHOLD_FRACTION);
   setupStallGuard(sgThreshold);
@@ -1182,6 +1291,7 @@ void setupDriver() {
   }
 }
 
+// Parse one serial command line.
 void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) {
@@ -1314,7 +1424,7 @@ void processCommand(String cmd) {
     }
     travelMin = 0;
     stepper->setCurrentPosition(0);
-    originSet = true;
+    resetIndexPos(0);
     plotPos(0);
     Serial.print("zeroed here (was pos ");
     Serial.print(here);
@@ -1377,6 +1487,7 @@ void processCommand(String cmd) {
     if (v == 8 || v == 16 || v == 32 || v == 64 || v == 128 || v == 256) {
       motor_microsteps = (uint16_t)v;
       driver.microsteps(motor_microsteps);
+      indexStepSize = 4 * (int32_t)motor_microsteps;
       Serial.print("microsteps=");
       Serial.println(motor_microsteps);
     }
@@ -1388,18 +1499,21 @@ void processCommand(String cmd) {
   }
 }
 
+// Boot: serial, pins, stepper, driver, help.
 void setup() {
   Serial.begin(115200);
   pinMode(DIAG_PIN, INPUT_PULLDOWN);
   delay(1500);
-  say("TMC2209 Serial2 UART + StallGuard (DIAG on GP6)");
+  say("TMC2209 Serial2 UART + StallGuard (DIAG on GP6, INDEX on GP7)");
 
   setupStepper();
+  setupIndex();
   setupDriver();
   printHelp();
-  say("Setup complete. Wire DIAG to GP6, tune z/y, then H.");
+  say("Setup complete. Wire DIAG to GP6, INDEX to GP7, tune z/y, then H.");
 }
 
+// Service sweep, stealth watchdog, live pos plots, and serial commands.
 void loop() {
   serviceSweep();
   serviceManualCurrentGuard();
