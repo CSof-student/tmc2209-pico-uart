@@ -45,6 +45,16 @@ Other envs: `rpipico`, `rpipicow`, `rpipico2w`.
 
 Monitor baud: **115200**.
 
+## WiFi (Pico W / Pico 2 W)
+
+Commands are the same over USB and TCP. 2.4 GHz only.
+
+1. `cp src/secrets.example.h src/secrets.h` and set `WIFI_SSID` / `WIFI_PASS` (`secrets.h` is gitignored).
+2. Upload `rpipico2w` or `rpipicow`. USB monitor prints `WiFi <ip>  nc <ip> 3333`.
+3. From your Mac: `nc <ip> 3333`
+
+Onboard LED blinks while joining, solid when up.
+
 ## First test
 
 1. Power **VM** and **VIO**, common GND, EN→GND, UART resistor network in place.

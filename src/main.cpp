@@ -12,12 +12,13 @@
     VIO 3.3V, VM motor PSU, GND common
 
   Linear actuator: + extends (out, toward travelMax), - retracts (in, toward 0).
-  USB 115200.
+  USB 115200. WiFi TCP port 3333 (Pico W / 2 W).
 */
 
 #include <Arduino.h>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
+#include "wifi_control.h"
 
 #define DIR_PIN    2
 #define STEP_PIN   3
@@ -93,6 +94,7 @@ int32_t sweepLo = 0;
 int32_t sweepHi = 0;
 int32_t sweepTarget = 0;
 String line;
+String wifiLine;
 bool stealthFrozen = false;
 uint8_t frozenOfs = 0;
 uint8_t frozenGrad = 0;
@@ -158,99 +160,116 @@ void setupIndex() {
 
 // Print a line and flush so it shows up immediately.
 void say(const char *msg) {
-  Serial.println(msg);
-  Serial.flush();
+  Out.println(msg);
+  Out.flush();
 }
 
 // Send stepper pos and INDEX-derived pos to Teleplot.
 void plotPos(int32_t pos) {
-  Serial.print(">pos:");
-  Serial.println(pos);
-  Serial.print(">ipos:");
-  Serial.println(readIndexPos());
+  Out.print(">pos:");
+  Out.println(pos);
+  Out.print(">ipos:");
+  Out.println(readIndexPos());
 }
 
 // Teleplot serial format is one ">name:value" line per variable.
 // Plot one homing sample: SG, DIAG, trip threshold, and both positions.
 void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t diag, int32_t pos) {
   if (sg != 0xFFFF) {
-    Serial.print(">sg:");
-    Serial.println(sg);
+    Out.print(">sg:");
+    Out.println(sg);
   }
-  Serial.print(">diag:");
-  Serial.println(diag);
-  Serial.print(">trip:");
-  Serial.println(trip);
+  Out.print(">diag:");
+  Out.println(diag);
+  Out.print(">trip:");
+  Out.println(trip);
   plotPos(pos);
 }
 
 // Print the serial command list.
 void printHelp() {
-  Serial.println();
-  Serial.println("Commands:");
-  Serial.println("  h/? help     t UART test     i status     x stop     0 set here as pos 0");
-  Serial.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
-  Serial.println("  c <mA>  m <usteps>");
-  Serial.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
-  Serial.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>");
-  Serial.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:  >ipos:");
-  Serial.println("  e [steps]  SG vs speed. Each run is a new Teleplot color (avg1..avg8)");
-  Serial.println("  k          print AUTO pwm_ofs / pwm_grad");
-  Serial.println("  k copy     lock those AUTO values (manual)");
-  Serial.println("  k <ofs> <grad>  lock those numbers (same each upload)");
-  Serial.println("  K          StealthChop AUTO again");
+  Out.println();
+  Out.println("Commands:");
+  Out.println("  h/? help     t UART test     i status     x stop     0 set here as pos 0");
+  Out.println("  +/- nudge (+extend -retract)  n <steps>  s <Hz>  a <accel>  g <pos>");
+  Out.println("  c <mA>  m <usteps>");
+  Out.println("  w [amp]  back-and-forth on/off (z while running; x also stops)");
+  Out.println("  z SG/DIAG    v TSTEP     f [steps] finger stall    y <0-255>");
+  Out.println("  H home to 0  (DIAG GP6). Teleplot: >sg:  >diag:  >trip:  >pos:  >ipos:");
+  Out.println("  e [steps]  SG vs speed. Each run is a new Teleplot color (avg1..avg8)");
+  Out.println("  k          print AUTO pwm_ofs / pwm_grad");
+  Out.println("  k copy     lock those AUTO values (manual)");
+  Out.println("  k <ofs> <grad>  lock those numbers (same each upload)");
+  Out.println("  K          StealthChop AUTO again");
+  Out.print("  WiFi nc ");
+  if (wifiIsConnected()) {
+    Out.print(wifiLocalIP());
+  } else {
+    Out.print("<ip>");
+  }
+  Out.print(' ');
+  Out.print(WIFI_CMD_PORT);
+  Out.println("  (same commands; USB still works)");
 }
 
 // Print position, speed, current, StallGuard, and stealthchop state.
 void printStatus() {
-  Serial.print("pos=");
-  Serial.print(stepper ? stepper->getCurrentPosition() : 0);
-  Serial.print("  ipos=");
-  Serial.print(readIndexPos());
-  Serial.print("  stepSize=");
-  Serial.print(stepSize);
-  Serial.print("  speedHz=");
-  Serial.print(moveSpeedHz);
-  Serial.print("  rms_mA=");
-  Serial.print(rmsMa);
-  Serial.print("  SGTHRS=");
-  Serial.print(sgThreshold);
-  Serial.print("  TCOOLTHRS=");
-  Serial.print(TCOOLTHRS_SETTING);
-  Serial.print("  DIAG=");
-  Serial.print(diagPinHigh() ? "HIGH" : "LOW");
-  Serial.print("  stealth=");
+  Out.print("pos=");
+  Out.print(stepper ? stepper->getCurrentPosition() : 0);
+  Out.print("  ipos=");
+  Out.print(readIndexPos());
+  Out.print("  stepSize=");
+  Out.print(stepSize);
+  Out.print("  speedHz=");
+  Out.print(moveSpeedHz);
+  Out.print("  rms_mA=");
+  Out.print(rmsMa);
+  Out.print("  SGTHRS=");
+  Out.print(sgThreshold);
+  Out.print("  TCOOLTHRS=");
+  Out.print(TCOOLTHRS_SETTING);
+  Out.print("  DIAG=");
+  Out.print(diagPinHigh() ? "HIGH" : "LOW");
+  Out.print("  stealth=");
   if (stealthFrozen) {
-    Serial.print("MANUAL ofs=");
-    Serial.print(frozenOfs);
-    Serial.print(" grad=");
-    Serial.print(frozenGrad);
+    Out.print("MANUAL ofs=");
+    Out.print(frozenOfs);
+    Out.print(" grad=");
+    Out.print(frozenGrad);
   } else {
-    Serial.print("AUTO ofs=");
-    Serial.print(driver.pwm_ofs_auto());
-    Serial.print(" grad=");
-    Serial.print(driver.pwm_grad_auto());
+    Out.print("AUTO ofs=");
+    Out.print(driver.pwm_ofs_auto());
+    Out.print(" grad=");
+    Out.print(driver.pwm_grad_auto());
   }
-  Serial.print("  sweep=");
-  Serial.println(sweepEnabled ? "on" : "off");
+  Out.print("  sweep=");
+  Out.println(sweepEnabled ? "on" : "off");
   if (travelCalibrated) {
-    Serial.print("  travel=0 (in) .. ");
-    Serial.print(travelMax);
-    Serial.println(" (out)");
+    Out.print("  travel=0 (in) .. ");
+    Out.print(travelMax);
+    Out.println(" (out)");
   } else {
-    Serial.println("  travel not calibrated (run H)");
+    Out.println("  travel not calibrated (run H)");
+  }
+  if (wifiIsConnected()) {
+    Out.print("  wifi=");
+    Out.print(wifiLocalIP());
+    Out.print(':');
+    Out.println(WIFI_CMD_PORT);
+  } else {
+    Out.println("  wifi=down");
   }
 }
 
 // Check TMC UART by reading connection status and chip version.
 void uartTest() {
   const uint8_t conn = driver.test_connection();
-  Serial.print("test_connection = ");
-  Serial.print(conn);
-  Serial.println(conn == 0 ? "  OK" : "  FAIL");
+  Out.print("test_connection = ");
+  Out.print(conn);
+  Out.println(conn == 0 ? "  OK" : "  FAIL");
   const uint8_t ver = driver.version();
-  Serial.print("TMC version = 0x");
-  Serial.println(ver, HEX);
+  Out.print("TMC version = 0x");
+  Out.println(ver, HEX);
   if (ver == 0x21) {
     say("UART OK (TMC2209)");
   } else {
@@ -271,10 +290,10 @@ void stopMotion();
 // Lock StealthChop PWM_OFS/PWM_GRAD and turn autoscaling off.
 bool applyManualStealth(uint8_t ofs, uint8_t grad) {
   if (ofs > PWM_OFS_MAX) {
-    Serial.print("PWM_OFS ");
-    Serial.print(ofs);
-    Serial.print(" clamped to ");
-    Serial.println(PWM_OFS_MAX);
+    Out.print("PWM_OFS ");
+    Out.print(ofs);
+    Out.print(" clamped to ");
+    Out.println(PWM_OFS_MAX);
     ofs = PWM_OFS_MAX;
   }
   if (ofs < 1) {
@@ -288,22 +307,22 @@ bool applyManualStealth(uint8_t ofs, uint8_t grad) {
   stealthFrozen = true;
   frozenOfs = ofs;
   frozenGrad = grad;
-  Serial.print("StealthChop MANUAL  ofs=");
-  Serial.print(ofs);
-  Serial.print("  grad=");
-  Serial.println(grad);
+  Out.print("StealthChop MANUAL  ofs=");
+  Out.print(ofs);
+  Out.print("  grad=");
+  Out.println(grad);
   say("IRUN does not limit PWM; OT/short watchdog is on. K = AUTO");
   return true;
 }
 
 // Print the AUTO-learned pwm_ofs and pwm_grad.
 void printAutoPwm() {
-  Serial.print("AUTO pwm_ofs=");
-  Serial.print(driver.pwm_ofs_auto());
-  Serial.print("  pwm_grad=");
-  Serial.println(driver.pwm_grad_auto());
-  Serial.println("  k copy            lock these");
-  Serial.println("  k <ofs> <grad>    lock numbers (survives if you paste into STEALTH_MANUAL_OFS/GRAD)");
+  Out.print("AUTO pwm_ofs=");
+  Out.print(driver.pwm_ofs_auto());
+  Out.print("  pwm_grad=");
+  Out.println(driver.pwm_grad_auto());
+  Out.println("  k copy            lock these");
+  Out.println("  k <ofs> <grad>    lock numbers (survives if you paste into STEALTH_MANUAL_OFS/GRAD)");
 }
 
 // Copy current AUTO PWM values into MANUAL lock.
@@ -398,6 +417,7 @@ void waitStepperIdle(uint32_t timeoutMs = 2000) {
   }
   const uint32_t t0 = millis();
   while (stepper->isRunning()) {
+    wifiService();
     if (millis() - t0 > timeoutMs) {
       stepper->forceStopAndNewPosition(stepper->getCurrentPosition());
       say("motion idle timeout — force stop");
@@ -424,12 +444,19 @@ void stopMotion() {
   }
 }
 
-// Drain serial during a long move; true if the user sent x.
+// Drain USB/TCP during a long move; true if the user sent x.
 static bool pollAbortX() {
+  wifiService();
   bool abort = false;
   while (Serial.available()) {
     const char ch = (char)Serial.read();
     if (ch == 'x' || ch == 'X') {
+      abort = true;
+    }
+  }
+  int w;
+  while ((w = wifiReadChar()) >= 0) {
+    if (w == 'x' || w == 'X') {
       abort = true;
     }
   }
@@ -546,21 +573,21 @@ static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float 
 // Print one Teleplot XY series for the current e-run.
 static void printSweepXy(const char *prefix, uint8_t run, const char *widget,
                          const uint32_t *hz, const float *y, uint8_t n, uint8_t decimals) {
-  Serial.print('>');
-  Serial.print(prefix);
-  Serial.print(run);
-  Serial.print(',');
-  Serial.print(widget);
-  Serial.print(':');
+  Out.print('>');
+  Out.print(prefix);
+  Out.print(run);
+  Out.print(',');
+  Out.print(widget);
+  Out.print(':');
   for (uint8_t i = 0; i < n; i++) {
     if (i) {
-      Serial.print(';');
+      Out.print(';');
     }
-    Serial.print(hz[i]);
-    Serial.print(':');
-    Serial.print(y[i], decimals);
+    Out.print(hz[i]);
+    Out.print(':');
+    Out.print(y[i], decimals);
   }
-  Serial.println("|xy,clr");
+  Out.println("|xy,clr");
 }
 
 // Dump speed vs SG and AUTO pwm_ofs/pwm_grad for this e-run to Teleplot.
@@ -612,26 +639,26 @@ void sgSpeedSweep(int32_t moveSteps) {
 
   say("");
   say("SG SPEED SWEEP  StealthChop AUTO");
-  Serial.print("extend ");
-  Serial.print(moveSteps);
-  Serial.print("  accel=");
-  Serial.print(SG_SWEEP_ACCEL);
-  Serial.print("  Hz ");
-  Serial.print(SG_SWEEP_HZ_LO);
-  Serial.print("..");
-  Serial.print(SG_SWEEP_HZ_HI);
-  Serial.print(" step ");
-  Serial.println(SG_SWEEP_HZ_STEP);
-  Serial.print("return to e-start pos=");
-  Serial.print(eStartPos);
-  Serial.print("  Teleplot run ");
-  Serial.print(sgSweepRun);
-  Serial.print("  avg");
-  Serial.print(sgSweepRun);
-  Serial.print(" amp");
-  Serial.println(sgSweepRun);
+  Out.print("extend ");
+  Out.print(moveSteps);
+  Out.print("  accel=");
+  Out.print(SG_SWEEP_ACCEL);
+  Out.print("  Hz ");
+  Out.print(SG_SWEEP_HZ_LO);
+  Out.print("..");
+  Out.print(SG_SWEEP_HZ_HI);
+  Out.print(" step ");
+  Out.println(SG_SWEEP_HZ_STEP);
+  Out.print("return to e-start pos=");
+  Out.print(eStartPos);
+  Out.print("  Teleplot run ");
+  Out.print(sgSweepRun);
+  Out.print("  avg");
+  Out.print(sgSweepRun);
+  Out.print(" amp");
+  Out.println(sgSweepRun);
   say("Leave Teleplot open to overlay runs in different colors  (x to abort)");
-  Serial.println("speed_hz,sg_avg,sg_amp,n,min,max,pwm_ofs,pwm_grad");
+  Out.println("speed_hz,sg_avg,sg_amp,n,min,max,pwm_ofs,pwm_grad");
 
   uint32_t hzOut[SG_SWEEP_MAX_SPEEDS];
   float avgOut[SG_SWEEP_MAX_SPEEDS];
@@ -657,21 +684,21 @@ void sgSpeedSweep(int32_t moveSteps) {
     uint16_t mn = 0, mx = 0;
     summarizeCruiseSg(buf, n, avg, amp, mn, mx);
 
-    Serial.print(hz);
-    Serial.print(",");
-    Serial.print(avg, 1);
-    Serial.print(",");
-    Serial.print(amp, 1);
-    Serial.print(",");
-    Serial.print(n);
-    Serial.print(",");
-    Serial.print(mn);
-    Serial.print(",");
-    Serial.print(mx);
-    Serial.print(",");
-    Serial.print(pwmOfs);
-    Serial.print(",");
-    Serial.println(pwmGrad);
+    Out.print(hz);
+    Out.print(",");
+    Out.print(avg, 1);
+    Out.print(",");
+    Out.print(amp, 1);
+    Out.print(",");
+    Out.print(n);
+    Out.print(",");
+    Out.print(mn);
+    Out.print(",");
+    Out.print(mx);
+    Out.print(",");
+    Out.print(pwmOfs);
+    Out.print(",");
+    Out.println(pwmGrad);
 
     if (n > 0 && nOut < SG_SWEEP_MAX_SPEEDS) {
       hzOut[nOut] = hz;
@@ -740,23 +767,23 @@ void startSweep(int32_t amplitude) {
   }
 
   if (moveAccel < (int32_t)(moveSpeedHz * 2)) {
-    Serial.print("accel ");
-    Serial.print(moveAccel);
-    Serial.print(" is low for speed ");
-    Serial.print(moveSpeedHz);
-    Serial.println(" — raise a so it reaches cruise (try a = 10x speed)");
+    Out.print("accel ");
+    Out.print(moveAccel);
+    Out.print(" is low for speed ");
+    Out.print(moveSpeedHz);
+    Out.println(" — raise a so it reaches cruise (try a = 10x speed)");
   }
 
   sweepEnabled = true;
   sweepTarget = (pos < (sweepLo + sweepHi) / 2) ? sweepHi : sweepLo;
   stepper->moveTo(sweepTarget);
-  Serial.print("sweep ON  ");
-  Serial.print(sweepLo);
-  Serial.print(" .. ");
-  Serial.print(sweepHi);
-  Serial.print("  speedHz=");
-  Serial.print(moveSpeedHz);
-  Serial.println("  (z to read SG, f = free vs finger stall, w or x to stop)");
+  Out.print("sweep ON  ");
+  Out.print(sweepLo);
+  Out.print(" .. ");
+  Out.print(sweepHi);
+  Out.print("  speedHz=");
+  Out.print(moveSpeedHz);
+  Out.println("  (z to read SG, f = free vs finger stall, w or x to stop)");
 }
 
 static const uint8_t SG_TEST_N = 20;
@@ -767,6 +794,7 @@ static const int32_t FINGER_TEST_STEPS = 1800;
 void delayMs(uint32_t ms) {
   const uint32_t t0 = millis();
   while (millis() - t0 < ms) {
+    wifiService();
     delay(5);
   }
 }
@@ -837,8 +865,8 @@ bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
     }
   }
   if (m == 0) {
-    Serial.print(label);
-    Serial.println(": no valid SG samples (UART?)");
+    Out.print(label);
+    Out.println(": no valid SG samples (UART?)");
     outMed = outMin = outMax = 0;
     return false;
   }
@@ -850,17 +878,17 @@ bool summarizeSg(const char *label, const uint16_t *raw, uint8_t n,
   for (uint8_t i = 0; i < m; i++) {
     sum += tmp[i];
   }
-  Serial.print(label);
-  Serial.print(": n=");
-  Serial.print(m);
-  Serial.print("  min=");
-  Serial.print(outMin);
-  Serial.print("  med=");
-  Serial.print(outMed);
-  Serial.print("  avg=");
-  Serial.print(sum / m);
-  Serial.print("  max=");
-  Serial.println(outMax);
+  Out.print(label);
+  Out.print(": n=");
+  Out.print(m);
+  Out.print("  min=");
+  Out.print(outMin);
+  Out.print("  med=");
+  Out.print(outMed);
+  Out.print("  avg=");
+  Out.print(sum / m);
+  Out.print("  max=");
+  Out.println(outMax);
   return true;
 }
 
@@ -885,9 +913,9 @@ bool startExtendBurst(int32_t steps) {
   }
 
   stepper->moveTo(dest);
-  Serial.print("extending ");
-  Serial.print(steps);
-  Serial.println(" steps (short burst)");
+  Out.print("extending ");
+  Out.print(steps);
+  Out.println(" steps (short burst)");
   return true;
 }
 
@@ -901,7 +929,7 @@ void fingerStallTest(int32_t steps) {
   say("");
   say("FINGER STALL TEST — two short one-way extends");
   say("Start from IN. Hands OFF for the first move.");
-  Serial.flush();
+  Out.flush();
 
   if (!startExtendBurst(steps)) {
     return;
@@ -917,13 +945,13 @@ void fingerStallTest(int32_t steps) {
   say("Motor stopped. Get ready to HOLD the shaft.");
   say("Next extend in:");
   for (int i = 5; i >= 1; i--) {
-    Serial.print("  ");
-    Serial.println(i);
-    Serial.flush();
+    Out.print("  ");
+    Out.println(i);
+    Out.flush();
     delayMs(1000);
   }
   say("HOLD NOW — extending into your finger...");
-  Serial.flush();
+  Out.flush();
 
   if (!startExtendBurst(steps)) {
     return;
@@ -942,8 +970,8 @@ void fingerStallTest(int32_t steps) {
     return;
   }
 
-  Serial.print("drop (med) = ");
-  Serial.println((int)freeMed - (int)stallMed);
+  Out.print("drop (med) = ");
+  Out.println((int)freeMed - (int)stallMed);
 
   if (stallMed >= freeMed) {
     say("No drop — StallGuard did not see the load. Try higher s/a, more current, or a harder hold.");
@@ -960,11 +988,11 @@ void fingerStallTest(int32_t steps) {
   if (y < 1) {
     y = 1;
   }
-  Serial.print("suggested y ");
-  Serial.print(y);
-  Serial.print("  (trip_below=");
-  Serial.print(2 * y);
-  Serial.println("). Set with y <n> if this looks right.");
+  Out.print("suggested y ");
+  Out.print(y);
+  Out.print("  (trip_below=");
+  Out.print(2 * y);
+  Out.println("). Set with y <n> if this looks right.");
 }
 
 // Clamp a goto target to calibrated travel, if any.
@@ -1005,22 +1033,22 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   const uint16_t trip = (uint16_t)(2 * sgThreshold);
   const int32_t startPos = stepper->getCurrentPosition();
 
-  Serial.print("--- ");
-  Serial.print(label);
-  Serial.print("  dir=");
-  Serial.print(dirSign > 0 ? "+" : "-");
-  Serial.print("  SGTHRS=");
-  Serial.print(sgThreshold);
-  Serial.print("  trip_below=");
-  Serial.print(trip);
-  Serial.print("  DIAG=GP");
-  Serial.print(DIAG_PIN);
-  Serial.print("  speed=");
-  Serial.print(HOME_SPEED_HZ);
-  Serial.print(" accel=");
-  Serial.print(HOME_ACCEL);
-  Serial.print("  arm_after=");
-  Serial.println(HOME_STALL_ARM_STEPS);
+  Out.print("--- ");
+  Out.print(label);
+  Out.print("  dir=");
+  Out.print(dirSign > 0 ? "+" : "-");
+  Out.print("  SGTHRS=");
+  Out.print(sgThreshold);
+  Out.print("  trip_below=");
+  Out.print(trip);
+  Out.print("  DIAG=GP");
+  Out.print(DIAG_PIN);
+  Out.print("  speed=");
+  Out.print(HOME_SPEED_HZ);
+  Out.print(" accel=");
+  Out.print(HOME_ACCEL);
+  Out.print("  arm_after=");
+  Out.println(HOME_STALL_ARM_STEPS);
 
   stepper->move((int32_t)dirSign * maxSteps);
 
@@ -1043,6 +1071,7 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   uint8_t medSettleHits = 0;
 
   while (stepper->isRunning()) {
+    wifiService();
     const int32_t posNow = stepper->getCurrentPosition();
     const int32_t moved = (posNow > startPos) ? (posNow - startPos) : (startPos - posNow);
 
@@ -1111,29 +1140,29 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
         setupStallGuard((uint8_t)autoY);
         armDiag();
         diagArmed = true;
-        Serial.print("  stall detect ON  sg med=");
-        Serial.print(sgMed);
-        Serial.print("  osc=");
-        Serial.print(lo);
-        Serial.print("..");
-        Serial.print(hi);
-        Serial.print("  trip_below=");
-        Serial.print(2 * sgThreshold);
-        Serial.print("  trip_above=");
-        Serial.print(tripHigh);
-        Serial.print("  pwm_ofs=");
-        Serial.print(driver.pwm_ofs_auto());
-        Serial.print("  pwm_grad=");
-        Serial.println(driver.pwm_grad_auto());
+        Out.print("  stall detect ON  sg med=");
+        Out.print(sgMed);
+        Out.print("  osc=");
+        Out.print(lo);
+        Out.print("..");
+        Out.print(hi);
+        Out.print("  trip_below=");
+        Out.print(2 * sgThreshold);
+        Out.print("  trip_above=");
+        Out.print(tripHigh);
+        Out.print("  pwm_ofs=");
+        Out.print(driver.pwm_ofs_auto());
+        Out.print("  pwm_grad=");
+        Out.println(driver.pwm_grad_auto());
       } else if (!loggedWaiting) {
         loggedWaiting = true;
-        Serial.print("  waiting for SG mean to settle (med=");
-        Serial.print(sgMed);
-        Serial.print(" osc=");
-        Serial.print(lo);
-        Serial.print("..");
-        Serial.print(hi);
-        Serial.println(") — oscillation is OK");
+        Out.print("  waiting for SG mean to settle (med=");
+        Out.print(sgMed);
+        Out.print(" osc=");
+        Out.print(lo);
+        Out.print("..");
+        Out.print(hi);
+        Out.println(") — oscillation is OK");
       }
     }
 
@@ -1171,23 +1200,23 @@ bool moveUntilStall(int dirSign, int32_t maxSteps, const char *label,
   }
 
   const int32_t endPos = stepper->getCurrentPosition();
-  Serial.print("  samples=");
-  Serial.print(n);
-  Serial.print("  last_sg=");
-  Serial.print(lastSg);
-  Serial.print("  moved=");
-  Serial.print(endPos - startPos);
-  Serial.print("  -> ");
+  Out.print("  samples=");
+  Out.print(n);
+  Out.print("  last_sg=");
+  Out.print(lastSg);
+  Out.print("  moved=");
+  Out.print(endPos - startPos);
+  Out.print("  -> ");
   if (stalled) {
-    Serial.print("STALL ");
-    Serial.print(source);
-    Serial.print("  pos=");
-    Serial.println(firstHitPos);
+    Out.print("STALL ");
+    Out.print(source);
+    Out.print("  pos=");
+    Out.println(firstHitPos);
     if (firstStallPos) {
       *firstStallPos = firstHitPos;
     }
   } else {
-    Serial.println("NO STALL (hit max travel or stopped)");
+    Out.println("NO STALL (hit max travel or stopped)");
     say("Hard end often raises SG (skipped steps), not a dip. Check trip_above vs the graph.");
   }
 
@@ -1206,12 +1235,12 @@ void homeBothEnds() {
   say("StallGuard home to 0 (in / retract) — stop is DIAG on GP6");
   say("Plot: Teleplot >sg: (UART, slow) and >diag: (hardware pulse)");
   setupStallGuard(sgThreshold);
-  Serial.print("SGTHRS=");
-  Serial.print(sgThreshold);
-  Serial.print("  home speed=");
-  Serial.print(HOME_SPEED_HZ);
-  Serial.print(" Hz  accel=");
-  Serial.println(HOME_ACCEL);
+  Out.print("SGTHRS=");
+  Out.print(sgThreshold);
+  Out.print("  home speed=");
+  Out.print(HOME_SPEED_HZ);
+  Out.print(" Hz  accel=");
+  Out.println(HOME_ACCEL);
 
   say("Seeking RETRACTED / IN (-) ...");
   if (!moveUntilStall(-1, HOME_MAX_TRAVEL, "RETRACT", nullptr)) {
@@ -1291,6 +1320,20 @@ void setupDriver() {
   }
 }
 
+void processCommand(String cmd);
+
+// Assemble one command line from USB or TCP.
+static void feedCommandStream(char ch, String &buf) {
+  if (ch == '\n' || ch == '\r') {
+    if (buf.length() > 0) {
+      processCommand(buf);
+      buf = "";
+    }
+  } else if (buf.length() < 80) {
+    buf += ch;
+  }
+}
+
 // Parse one serial command line.
 void processCommand(String cmd) {
   cmd.trim();
@@ -1312,33 +1355,33 @@ void processCommand(String cmd) {
     const uint16_t sg = readStallGuard();
     const uint16_t trip = (uint16_t)(2 * sgThreshold);
     const bool velocityValid = stallGuardVelocityValid(tstep);
-    Serial.print("TSTEP=");
-    Serial.print(tstep);
-    Serial.print(velocityValid ? "  SG_ON" : "  SG_OFF");
-    Serial.print("  SG_RESULT=");
-    Serial.print(sg);
-    Serial.print("  SGTHRS=");
-    Serial.print(sgThreshold);
-    Serial.print("  trip_below=");
-    Serial.print(trip);
-    Serial.print("  DIAG=");
-    Serial.print(diagPinHigh() ? "HIGH" : "LOW");
-    Serial.print("  pwm_ofs=");
-    Serial.print(driver.pwm_ofs_auto());
-    Serial.print("  pwm_grad=");
-    Serial.print(driver.pwm_grad_auto());
-    Serial.print("  stealth=");
-    Serial.print(stealthFrozen ? "MANUAL" : "AUTO");
-    Serial.print("  stalled=");
-    Serial.println(velocityValid && isStalled(sg) ? "yes" : "no");
+    Out.print("TSTEP=");
+    Out.print(tstep);
+    Out.print(velocityValid ? "  SG_ON" : "  SG_OFF");
+    Out.print("  SG_RESULT=");
+    Out.print(sg);
+    Out.print("  SGTHRS=");
+    Out.print(sgThreshold);
+    Out.print("  trip_below=");
+    Out.print(trip);
+    Out.print("  DIAG=");
+    Out.print(diagPinHigh() ? "HIGH" : "LOW");
+    Out.print("  pwm_ofs=");
+    Out.print(driver.pwm_ofs_auto());
+    Out.print("  pwm_grad=");
+    Out.print(driver.pwm_grad_auto());
+    Out.print("  stealth=");
+    Out.print(stealthFrozen ? "MANUAL" : "AUTO");
+    Out.print("  stalled=");
+    Out.println(velocityValid && isStalled(sg) ? "yes" : "no");
   } else if (c == 'v' || c == 'V') {
     const uint32_t tstep = readTstep();
-    Serial.print("TSTEP=");
-    Serial.print(tstep);
-    Serial.print("  TCOOLTHRS=");
-    Serial.print(TCOOLTHRS_SETTING);
-    Serial.print("  StallGuard velocity gate=");
-    Serial.println(stallGuardVelocityValid(tstep) ? "ON" : "OFF");
+    Out.print("TSTEP=");
+    Out.print(tstep);
+    Out.print("  TCOOLTHRS=");
+    Out.print(TCOOLTHRS_SETTING);
+    Out.print("  StallGuard velocity gate=");
+    Out.println(stallGuardVelocityValid(tstep) ? "ON" : "OFF");
   } else if (c == 'k') {
     String rest = cmd.substring(1);
     rest.trim();
@@ -1380,10 +1423,10 @@ void processCommand(String cmd) {
     const int v = cmd.substring(1).toInt();
     if (v >= 0 && v <= 255) {
       setupStallGuard((uint8_t)v);
-      Serial.print("SGTHRS=");
-      Serial.print(sgThreshold);
-      Serial.print("  trip_below=");
-      Serial.println(2 * sgThreshold);
+      Out.print("SGTHRS=");
+      Out.print(sgThreshold);
+      Out.print("  trip_below=");
+      Out.println(2 * sgThreshold);
     }
   } else if (c == 'w' || c == 'W') {
     if (sweepEnabled) {
@@ -1406,8 +1449,8 @@ void processCommand(String cmd) {
     stopMotion();
     const int32_t dest = clampToTravel(cmd.substring(1).toInt());
     stepper->moveTo(dest);
-    Serial.print("goto ");
-    Serial.println(dest);
+    Out.print("goto ");
+    Out.println(dest);
   } else if (c == '0') {
     if (!stepper) {
       return;
@@ -1426,9 +1469,9 @@ void processCommand(String cmd) {
     stepper->setCurrentPosition(0);
     resetIndexPos(0);
     plotPos(0);
-    Serial.print("zeroed here (was pos ");
-    Serial.print(here);
-    Serial.println(")");
+    Out.print("zeroed here (was pos ");
+    Out.print(here);
+    Out.println(")");
     printStatus();
   } else if (c == '+' || c == '-') {
     int32_t delta = (c == '+') ? stepSize : -stepSize;
@@ -1445,38 +1488,38 @@ void processCommand(String cmd) {
     if (stepper) {
       stepper->move(delta);
     }
-    Serial.print("move ");
-    Serial.println(delta);
+    Out.print("move ");
+    Out.println(delta);
   } else if (c == 'n' || c == 'N') {
     const int32_t v = cmd.substring(1).toInt();
     if (v > 0) {
       stepSize = v;
-      Serial.print("stepSize=");
-      Serial.println(stepSize);
+      Out.print("stepSize=");
+      Out.println(stepSize);
     }
   } else if (c == 's' || c == 'S') {
     const uint32_t v = (uint32_t)cmd.substring(1).toInt();
     if (v > 0 && stepper) {
       moveSpeedHz = v;
       stepper->setSpeedInHz(v);
-      Serial.print("speedHz=");
-      Serial.println(moveSpeedHz);
+      Out.print("speedHz=");
+      Out.println(moveSpeedHz);
     }
   } else if (c == 'a' || c == 'A') {
     const int32_t v = cmd.substring(1).toInt();
     if (v > 0 && stepper) {
       moveAccel = v;
       stepper->setAcceleration(v);
-      Serial.print("accel=");
-      Serial.println(moveAccel);
+      Out.print("accel=");
+      Out.println(moveAccel);
     }
   } else if (c == 'c' || c == 'C') {
     const int v = cmd.substring(1).toInt();
     if (v > 0 && v < 2000) {
       rmsMa = (uint16_t)v;
       driver.rms_current(rmsMa, IHOLD_FRACTION);
-      Serial.print("rms_mA=");
-      Serial.println(rmsMa);
+      Out.print("rms_mA=");
+      Out.println(rmsMa);
       if (stealthFrozen) {
         unfreezeStealthChop();
         say("current changed — StealthChop back to AUTO (re-learn, then k or H to lock)");
@@ -1488,8 +1531,8 @@ void processCommand(String cmd) {
       motor_microsteps = (uint16_t)v;
       driver.microsteps(motor_microsteps);
       indexStepSize = 4 * (int32_t)motor_microsteps;
-      Serial.print("microsteps=");
-      Serial.println(motor_microsteps);
+      Out.print("microsteps=");
+      Out.println(motor_microsteps);
     }
   } else if (c == 'x' || c == 'X') {
     stopMotion();
@@ -1503,6 +1546,7 @@ void processCommand(String cmd) {
 void setup() {
   Serial.begin(115200);
   pinMode(DIAG_PIN, INPUT_PULLDOWN);
+  wifiSetup();
   delay(1500);
   say("TMC2209 Serial2 UART + StallGuard (DIAG on GP6, INDEX on GP7)");
 
@@ -1515,6 +1559,7 @@ void setup() {
 
 // Service sweep, stealth watchdog, live pos plots, and serial commands.
 void loop() {
+  wifiService();
   serviceSweep();
   serviceManualCurrentGuard();
 
@@ -1528,14 +1573,10 @@ void loop() {
   }
 
   while (Serial.available()) {
-    const char ch = (char)Serial.read();
-    if (ch == '\n' || ch == '\r') {
-      if (line.length() > 0) {
-        processCommand(line);
-        line = "";
-      }
-    } else {
-      line += ch;
-    }
+    feedCommandStream((char)Serial.read(), line);
+  }
+  int ch;
+  while ((ch = wifiReadChar()) >= 0) {
+    feedCommandStream((char)ch, wifiLine);
   }
 }
