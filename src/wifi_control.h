@@ -24,11 +24,20 @@ IPAddress wifiLocalIP();
 int wifiReadChar();
 void wifiPrintStatus();
 
-// USB serial plus every connected TCP client.
+// USB serial plus every connected TCP client (command replies).
 class CmdOut : public Print {
  public:
   size_t write(uint8_t c) override;
   size_t write(const uint8_t *buffer, size_t size) override;
 };
 
+// USB only. Teleplot must not go over TCP — it fills the WiFi send
+// buffer and client.write() can stall the command loop.
+class UsbOut : public Print {
+ public:
+  size_t write(uint8_t c) override;
+  size_t write(const uint8_t *buffer, size_t size) override;
+};
+
 extern CmdOut Out;
+extern UsbOut Plot;

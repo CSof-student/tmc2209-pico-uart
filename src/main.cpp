@@ -166,23 +166,23 @@ void say(const char *msg) {
 
 // Send stepper pos and INDEX-derived pos to Teleplot.
 void plotPos(int32_t pos) {
-  Out.print(">pos:");
-  Out.println(pos);
-  Out.print(">ipos:");
-  Out.println(readIndexPos());
+  Plot.print(">pos:");
+  Plot.println(pos);
+  Plot.print(">ipos:");
+  Plot.println(readIndexPos());
 }
 
 // Teleplot serial format is one ">name:value" line per variable.
 // Plot one homing sample: SG, DIAG, trip threshold, and both positions.
 void plotHomeSample(uint16_t sg, uint16_t trip, uint8_t diag, int32_t pos) {
   if (sg != 0xFFFF) {
-    Out.print(">sg:");
-    Out.println(sg);
+    Plot.print(">sg:");
+    Plot.println(sg);
   }
-  Out.print(">diag:");
-  Out.println(diag);
-  Out.print(">trip:");
-  Out.println(trip);
+  Plot.print(">diag:");
+  Plot.println(diag);
+  Plot.print(">trip:");
+  Plot.println(trip);
   plotPos(pos);
 }
 
@@ -558,21 +558,21 @@ static void summarizeCruiseSg(const uint16_t *buf, uint8_t n, float &avg, float 
 // Print one Teleplot XY series for the current e-run.
 static void printSweepXy(const char *prefix, uint8_t run, const char *widget,
                          const uint32_t *hz, const float *y, uint8_t n, uint8_t decimals) {
-  Out.print('>');
-  Out.print(prefix);
-  Out.print(run);
-  Out.print(',');
-  Out.print(widget);
-  Out.print(':');
+  Plot.print('>');
+  Plot.print(prefix);
+  Plot.print(run);
+  Plot.print(',');
+  Plot.print(widget);
+  Plot.print(':');
   for (uint8_t i = 0; i < n; i++) {
     if (i) {
-      Out.print(';');
+      Plot.print(';');
     }
-    Out.print(hz[i]);
-    Out.print(':');
-    Out.print(y[i], decimals);
+    Plot.print(hz[i]);
+    Plot.print(':');
+    Plot.print(y[i], decimals);
   }
-  Out.println("|xy,clr");
+  Plot.println("|xy,clr");
 }
 
 // Dump speed vs SG and AUTO pwm_ofs/pwm_grad for this e-run to Teleplot.
@@ -1545,6 +1545,14 @@ void setup() {
 // Service sweep, stealth watchdog, live pos plots, and serial commands.
 void loop() {
   wifiService();
+  while (Serial.available()) {
+    feedCommandStream((char)Serial.read(), line);
+  }
+  int ch;
+  while ((ch = wifiReadChar()) >= 0) {
+    feedCommandStream((char)ch, wifiLine);
+  }
+
   serviceSweep();
   serviceManualCurrentGuard();
 
@@ -1555,13 +1563,5 @@ void loop() {
       lastPosPlotMs = now;
       plotPos(stepper->getCurrentPosition());
     }
-  }
-
-  while (Serial.available()) {
-    feedCommandStream((char)Serial.read(), line);
-  }
-  int ch;
-  while ((ch = wifiReadChar()) >= 0) {
-    feedCommandStream((char)ch, wifiLine);
   }
 }

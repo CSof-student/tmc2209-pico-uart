@@ -24,6 +24,18 @@ static const uint8_t kMaxClients = 2;
 static const uint32_t kRejoinMs = 15000;
 
 CmdOut Out;
+UsbOut Plot;
+
+static void usbWrite(const uint8_t *buf, size_t n) {
+  if (n == 0 || !Serial) {
+    return;
+  }
+  const int space = Serial.availableForWrite();
+  if (space <= 0) {
+    return;
+  }
+  Serial.write(buf, n < (size_t)space ? n : (size_t)space);
+}
 
 #if TMC_HAS_WIFI
 static WiFiServer server(WIFI_CMD_PORT);
@@ -67,9 +79,14 @@ static void wifiWrite(const uint8_t *buf, size_t n) {
     if (!clients[i] || !clients[i].connected()) {
       continue;
     }
-    if (clients[i].write(buf, n) != n) {
-      clients[i].stop();
+    int space = clients[i].availableForWrite();
+    if (space <= 0) {
+      continue;
     }
+    if ((size_t)space > n) {
+      space = (int)n;
+    }
+    clients[i].write(buf, (size_t)space);
   }
 }
 
@@ -79,6 +96,7 @@ static void acceptClients() {
     return;
   }
   incoming.setNoDelay(true);
+  incoming.setSync(false);
   incoming.setTimeout(10);
   for (uint8_t i = 0; i < kMaxClients; i++) {
     if (!clients[i] || !clients[i].connected()) {
@@ -265,7 +283,7 @@ int wifiReadChar() {
 }
 
 size_t CmdOut::write(uint8_t c) {
-  Serial.write(c);
+  usbWrite(&c, 1);
 #if TMC_HAS_WIFI
   wifiWrite(&c, 1);
 #endif
@@ -273,9 +291,19 @@ size_t CmdOut::write(uint8_t c) {
 }
 
 size_t CmdOut::write(const uint8_t *buffer, size_t size) {
-  Serial.write(buffer, size);
+  usbWrite(buffer, size);
 #if TMC_HAS_WIFI
   wifiWrite(buffer, size);
 #endif
+  return size;
+}
+
+size_t UsbOut::write(uint8_t c) {
+  usbWrite(&c, 1);
+  return 1;
+}
+
+size_t UsbOut::write(const uint8_t *buffer, size_t size) {
+  usbWrite(buffer, size);
   return size;
 }
