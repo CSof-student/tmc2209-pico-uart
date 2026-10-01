@@ -22,6 +22,7 @@ void wifiService();
 bool wifiIsConnected();
 IPAddress wifiLocalIP();
 int wifiReadChar();
+void wifiPrintStatus();
 
 // USB serial plus every connected TCP client.
 class CmdOut : public Print {

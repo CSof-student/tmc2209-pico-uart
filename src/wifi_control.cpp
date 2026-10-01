@@ -97,6 +97,27 @@ static void setLed(bool on) {
   digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
   ledOn = on;
 }
+
+static const char *wifiStatusName(uint8_t st) {
+  switch (st) {
+    case WL_IDLE_STATUS:
+      return "idle";
+    case WL_NO_SSID_AVAIL:
+      return "no-ssid";
+    case WL_SCAN_COMPLETED:
+      return "scanned";
+    case WL_CONNECTED:
+      return "connected";
+    case WL_CONNECT_FAILED:
+      return "fail";
+    case WL_CONNECTION_LOST:
+      return "lost";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    default:
+      return "other";
+  }
+}
 #endif
 
 void wifiSetup() {
@@ -153,6 +174,10 @@ void wifiService() {
     setLed(!ledOn);
   }
   if (now - lastJoinMs >= kRejoinMs) {
+    Serial.print("WiFi: retry ");
+    Serial.print(WIFI_SSID);
+    Serial.print("  st=");
+    Serial.println(wifiStatusName(WiFi.status()));
     startJoin();
   }
 #endif
@@ -163,6 +188,35 @@ bool wifiIsConnected() {
   return joinStarted && WiFi.connected();
 #else
   return false;
+#endif
+}
+
+void wifiPrintStatus() {
+#if !TMC_HAS_WIFI
+  Out.println("  wifi=down  no-radio (build env must be rpipico2w / rpipicow)");
+  return;
+#else
+  if (!haveCredentials()) {
+    Out.println("  wifi=down  no-secrets (src/secrets.h missing or still placeholder)");
+    return;
+  }
+  if (wifiIsConnected()) {
+    Out.print("  wifi=");
+    Out.print(WiFi.localIP());
+    Out.print(':');
+    Out.print(WIFI_CMD_PORT);
+    Out.print("  ssid=");
+    Out.println(WIFI_SSID);
+    return;
+  }
+  Out.print("  wifi=down  ssid=");
+  Out.print(WIFI_SSID);
+  Out.print("  st=");
+  Out.print(wifiStatusName(WiFi.status()));
+  Out.print('(');
+  Out.print(WiFi.status());
+  Out.print(')');
+  Out.println(joinStarted ? "  still joining" : "  join not started");
 #endif
 }
 

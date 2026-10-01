@@ -201,15 +201,7 @@ void printHelp() {
   Out.println("  k copy     lock those AUTO values (manual)");
   Out.println("  k <ofs> <grad>  lock those numbers (same each upload)");
   Out.println("  K          StealthChop AUTO again");
-  Out.print("  WiFi nc ");
-  if (wifiIsConnected()) {
-    Out.print(wifiLocalIP());
-  } else {
-    Out.print("<ip>");
-  }
-  Out.print(' ');
-  Out.print(WIFI_CMD_PORT);
-  Out.println("  (same commands; USB still works)");
+  wifiPrintStatus();
 }
 
 // Print position, speed, current, StallGuard, and stealthchop state.
@@ -251,14 +243,7 @@ void printStatus() {
   } else {
     Out.println("  travel not calibrated (run H)");
   }
-  if (wifiIsConnected()) {
-    Out.print("  wifi=");
-    Out.print(wifiLocalIP());
-    Out.print(':');
-    Out.println(WIFI_CMD_PORT);
-  } else {
-    Out.println("  wifi=down");
-  }
+  wifiPrintStatus();
 }
 
 // Check TMC UART by reading connection status and chip version.
