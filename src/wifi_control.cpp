@@ -217,6 +217,30 @@ void wifiPrintStatus() {
   Out.print(WiFi.status());
   Out.print(')');
   Out.println(joinStarted ? "  still joining" : "  join not started");
+  Out.println("  scanning 2.4 GHz...");
+  const int8_t n = WiFi.scanNetworks();
+  if (n <= 0) {
+    Out.println("  scan: none (out of range, or no 2.4 GHz APs)");
+    return;
+  }
+  bool seen = false;
+  for (int8_t i = 0; i < n && i < 16; i++) {
+    const bool match = strcmp(WiFi.SSID(i), WIFI_SSID) == 0;
+    if (match) {
+      seen = true;
+    }
+    Out.print(match ? "  * " : "    ");
+    Out.print(WiFi.SSID(i));
+    Out.print("  ch=");
+    Out.print(WiFi.channel(i));
+    Out.print("  rssi=");
+    Out.println(WiFi.RSSI(i));
+  }
+  if (seen) {
+    Out.println("  SSID found — fail is usually password or WPA3-only (Pico needs WPA2)");
+  } else {
+    Out.println("  SSID not in 2.4 GHz scan — wrong name, or that AP is 5 GHz only");
+  }
 #endif
 }
 
