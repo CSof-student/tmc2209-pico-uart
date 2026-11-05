@@ -4,6 +4,7 @@
 
 #if TMC_HAS_WIFI
 #include <WiFi.h>
+#include "pico/cyw43_arch.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -118,6 +119,23 @@ static void setLed(bool on) {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
   ledOn = on;
+}
+
+static const char *cyw43LinkName(int st) {
+  switch (st) {
+    case CYW43_LINK_DOWN:
+      return "down";
+    case CYW43_LINK_JOIN:
+      return "join";
+    case CYW43_LINK_FAIL:
+      return "fail";
+    case CYW43_LINK_NONET:
+      return "nonet";
+    case CYW43_LINK_BADAUTH:
+      return "badauth";
+    default:
+      return "other";
+  }
 }
 
 static const char *wifiStatusName(uint8_t st) {
@@ -244,14 +262,29 @@ void wifiPrintStatus() {
     Out.println(WIFI_SSID);
     return;
   }
+  const int link = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
   Out.print("  wifi=down  ssid=");
   Out.print(WIFI_SSID);
   Out.print("  st=");
   Out.print(wifiStatusName(WiFi.status()));
   Out.print('(');
   Out.print(WiFi.status());
+  Out.print(")  cyw43=");
+  Out.print(cyw43LinkName(link));
+  Out.print('(');
+  Out.print(link);
   Out.print(')');
   Out.println(joinStarted ? "  still joining" : "  join not started");
+  if (link == CYW43_LINK_BADAUTH) {
+    Out.println("  badauth: password or WPA3-only (Pico wants WPA2)");
+  } else if (link == CYW43_LINK_NONET) {
+    Out.println("  nonet: AP refused the join (range, MAC filter, or scan interrupted associate)");
+  } else if (link == CYW43_LINK_JOIN) {
+    Out.println("  radio joined, waiting for DHCP");
+  } else if (link == CYW43_LINK_DOWN || (millis() - lastJoinMs) < kJoinGiveUpMs) {
+    Out.println("  join in progress — not scanning (scan aborts associate). Wait for IP, then i.");
+    return;
+  }
   Out.println("  scanning 2.4 GHz...");
   const int8_t n = WiFi.scanNetworks();
   if (n <= 0) {
@@ -259,10 +292,12 @@ void wifiPrintStatus() {
     return;
   }
   bool seen = false;
+  int32_t matchRssi = 0;
   for (int8_t i = 0; i < n && i < 16; i++) {
     const bool match = strcmp(WiFi.SSID(i), WIFI_SSID) == 0;
     if (match) {
       seen = true;
+      matchRssi = WiFi.RSSI(i);
     }
     Out.print(match ? "  * " : "    ");
     Out.print(WiFi.SSID(i));
@@ -272,7 +307,11 @@ void wifiPrintStatus() {
     Out.println(WiFi.RSSI(i));
   }
   if (seen) {
-    Out.println("  SSID found — fail is usually password or WPA3-only (Pico needs WPA2)");
+    Out.print("  SSID found  rssi=");
+    Out.println(matchRssi);
+    if (matchRssi < -80) {
+      Out.println("  signal is weak — move closer to the AP");
+    }
   } else {
     Out.println("  SSID not in 2.4 GHz scan — wrong name, or that AP is 5 GHz only");
   }
