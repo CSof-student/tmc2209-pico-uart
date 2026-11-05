@@ -21,7 +21,8 @@
 
 static const char *kPlaceholderSsid = "your-2.4ghz-ssid";
 static const uint8_t kMaxClients = 2;
-static const uint32_t kRejoinMs = 15000;
+static const uint32_t kJoinGiveUpMs = 45000;
+static const uint32_t kWaitLogMs = 5000;
 
 CmdOut Out;
 UsbOut Plot;
@@ -44,6 +45,7 @@ static bool joinStarted = false;
 static bool serverUp = false;
 static bool announced = false;
 static uint32_t lastJoinMs = 0;
+static uint32_t lastWaitLogMs = 0;
 static uint32_t lastLedMs = 0;
 static bool ledOn = false;
 
@@ -54,12 +56,14 @@ static bool haveCredentials() {
 static void startJoin() {
   WiFi.mode(WIFI_STA);
   WiFi.hostname("tmc-pico");
+  WiFi.setTimeout(30000);
   if (WIFI_PASS[0] == '\0') {
     WiFi.beginNoBlock(WIFI_SSID);
   } else {
     WiFi.beginNoBlock(WIFI_SSID, WIFI_PASS);
   }
   lastJoinMs = millis();
+  lastWaitLogMs = lastJoinMs;
   joinStarted = true;
 }
 
@@ -191,12 +195,25 @@ void wifiService() {
     lastLedMs = now;
     setLed(!ledOn);
   }
-  if (now - lastJoinMs >= kRejoinMs) {
-    Serial.print("WiFi: retry ");
+
+  const uint8_t st = WiFi.status();
+  const bool hardFail =
+      st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL || st == WL_CONNECTION_LOST;
+  const bool giveUp = (now - lastJoinMs) >= kJoinGiveUpMs;
+  if (hardFail || giveUp) {
+    Serial.print("WiFi: restart ");
     Serial.print(WIFI_SSID);
     Serial.print("  st=");
-    Serial.println(wifiStatusName(WiFi.status()));
+    Serial.println(wifiStatusName(st));
     startJoin();
+    return;
+  }
+  if (now - lastWaitLogMs >= kWaitLogMs) {
+    lastWaitLogMs = now;
+    Serial.print("WiFi: waiting ");
+    Serial.print(WIFI_SSID);
+    Serial.print("  st=");
+    Serial.println(wifiStatusName(st));
   }
 #endif
 }
